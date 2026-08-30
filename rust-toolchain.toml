@@ -1,0 +1,12 @@
+# MSVC rather than the GNU host toolchain.
+#
+# Two reasons, both Windows-specific:
+#
+#  * Tauri's resource compiler runs `windres` under the GNU toolchain, and
+#    `windres` cannot handle a space in the build path — which this project has.
+#    The MSVC resource compiler handles it correctly.
+#  * A shipped desktop binary should use the platform's native ABI and not drag
+#    MinGW runtime DLLs along with it.
+[toolchain]
+channel = "stable-x86_64-pc-windows-msvc"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+
+# Staging directories left behind by an interrupted receive
+.jetstream/
+
+# Node / frontend (desktop app)
+node_modules/
+dist/
+.vite/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store

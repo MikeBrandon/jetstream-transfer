@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Jetstream</title>
+<!--
+  The browser client.
+
+  One self-contained file: no framework, no bundler, no second build pipeline.
+  It is a few screens, and it has to load fast over Wi-Fi on a phone that has
+  just scanned a code.
+
+  Two constraints shape the code below, both from serving over plain HTTP:
+
+    * No secure context, so `crypto.subtle` and `navigator.clipboard.writeText`
+      are unavailable. Hashing is CRC-32 in JavaScript (see the Rust-side
+      `crc32` module for why that is the right trade here), and copying falls
+      back to selecting the text.
+    * No service worker, so a background upload cannot survive the tab closing.
+      The upload is resumable instead, which is better: reopening the page and
+      picking the same files continues where it stopped.
+-->
+<style>
+  :root {
+    --cyan: #62b3c5;
+    --pink: #e7507e;
+    --amber: #fbb583;
+    --bg: #0f1417;
+    --raised: #161d21;
+    --sunken: #0a0e10;
+    --line: #263238;
+    --text: #e8eef0;
+    --dim: #93a5ad;
+    --faint: #64757d;
+    --ok: #5fc48f;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: max(18px, env(safe-area-inset-top)) 18px calc(28px + env(safe-area-inset-bottom));
+    max-width: 620px;
+    margin-inline: auto;
+    min-height: 100vh;
+  }
+  header { display: flex; align-items: center; gap: 11px; margin-bottom: 22px; }
+  .mark {
+    width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+    background: linear-gradient(135deg, var(--cyan), var(--amber) 55%, var(--pink));
+  }
+  h1 { font-size: 17px; letter-spacing: .07em; margin: 0; font-weight: 600; }
+  .to { color: var(--dim); font-size: 13px; margin: 1px 0 0; }
+  h2 {
+    font-size: 11.5px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--faint); margin: 26px 0 10px; font-weight: 600;
+  }
+  .card { background: var(--raised); border: 1px solid var(--line); border-radius: 13px; padding: 15px; }
+  button, .btn {
+    font: inherit; border: 0; border-radius: 10px; padding: 13px 18px;
+    background: var(--cyan); color: #08161a; font-weight: 600;
+    width: 100%; display: block; text-align: center; text-decoration: none;
+    cursor: pointer; touch-action: manipulation;
+  }
+  button:disabled { opacity: .5; }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); font-weight: 400; }
+  button.small { padding: 9px 13px; font-size: 13.5px; width: auto; display: inline-block; }
+  input[type=file] { display: none; }
+  textarea {
+    width: 100%; min-height: 92px; font: inherit; padding: 11px;
+    background: var(--sunken); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; resize: vertical;
+  }
+  .row { display: flex; align-items: center; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+  .row:last-child { border-bottom: 0; }
+  .row .grow { flex: 1; min-width: 0; }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { color: var(--faint); font-size: 12.5px; }
+  .bar { height: 6px; background: var(--sunken); border-radius: 999px; overflow: hidden; margin-top: 12px; }
+  .bar > i { display: block; height: 100%; width: 0; border-radius: 999px; background: linear-gradient(90deg, var(--cyan), var(--amber)); transition: width .2s; }
+  .bar.done > i { background: var(--ok); }
+  .bar.failed > i { background: var(--pink); }
+  .status { margin-top: 10px; font-size: 13.5px; color: var(--dim); }
+  .status.bad { color: var(--pink); }
+  .status.good { color: var(--ok); }
+  .note { color: var(--faint); font-size: 12.5px; margin-top: 10px; }
+  .stack > * + * { margin-top: 10px; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f4f7f8; --raised:#fff; --sunken:#e9eff1; --line:#d5e0e3; --text:#16232a; --dim:#55686f; --faint:#86979e; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="mark"></div>
+  <div>
+    <h1>JETSTREAM</h1>
+    <p class="to" id="to">connecting…</p>
+  </div>
+</header>
+
+<h2>Send to this computer</h2>
+<div class="card stack">
+  <input type="file" id="files" multiple>
+  <input type="file" id="folder" webkitdirectory>
+  <button id="pickFiles">Choose files</button>
+  <button id="pickFolder" class="ghost">Choose a folder</button>
+  <div id="uploadBox" hidden>
+    <div class="row" style="border:0;padding-top:14px">
+      <div class="grow">
+        <div class="name" id="upName">—</div>
+        <div class="meta" id="upMeta"></div>
+      </div>
+    </div>
+    <div class="bar" id="upBar"><i></i></div>
+    <div class="status" id="upStatus"></div>
+    <div style="margin-top:12px" id="upActions" hidden>
+      <button class="ghost small" id="retry">Resume</button>
+    </div>
+  </div>
+  <p class="note">
+    Large uploads carry on where they stopped if the connection drops — just pick
+    the same files again.
+  </p>
+</div>
+
+<h2>Send text</h2>
+<div class="card stack">
+  <textarea id="text" placeholder="Type or paste anything…"></textarea>
+  <button id="sendText">Send text</button>
+  <div class="status" id="textStatus"></div>
+</div>
+
+<section id="downloadSection" hidden>
+  <h2>Waiting for you</h2>
+  <div class="card" id="downloads"></div>
+</section>
+
+<section id="sharedSection" hidden>
+  <h2>Text from this computer</h2>
+  <div class="card stack">
+    <textarea id="shared" readonly></textarea>
+    <button class="ghost" id="copyShared">Select all to copy</button>
+  </div>
+</section>
+
+<p class="note" style="margin-top:26px">
+  This connection is on your local network and is not encrypted. Files are
+  checked for corruption as they arrive.
+</p>
+
+<script>
+"use strict";
+
+/* ---------------------------------------------------------------- CRC-32 -- */
+
+/* Standard CRC-32 (0xEDB88320, reflected) — matches zlib and the Rust side.
+   Table-driven, so a megabyte costs a few milliseconds. */
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/* ---------------------------------------------------------------- helpers -- */
+
+const $ = (id) => document.getElementById(id);
+
+function bytes(n) {
+  if (n < 1024) return n + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024, u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return v.toFixed(1) + " " + units[u];
+}
+
+async function api(path, options) {
+  const response = await fetch(path, { credentials: "same-origin", ...options });
+  if (!response.ok) throw new Error((await response.text()) || response.statusText);
+  return response;
+}
+
+/* --------------------------------------------------------------- session -- */
+
+let CHUNK = 1048576;
+
+async function loadSession() {
+  try {
+    const info = await (await api("/api/session")).json();
+    CHUNK = info.chunkSize || CHUNK;
+    $("to").textContent = "connected to " + info.deviceName;
+    document.title = "Jetstream — " + info.deviceName;
+
+    renderDownloads(info.files || []);
+
+    if (info.sharedText) {
+      $("sharedSection").hidden = false;
+      $("shared").value = info.sharedText;
+    }
+  } catch (e) {
+    $("to").textContent = "this link has expired — scan the code again";
+  }
+}
+
+function renderDownloads(files) {
+  if (!files.length) return;
+
+  $("downloadSection").hidden = false;
+  $("downloads").innerHTML = "";
+
+  for (const file of files) {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML =
+      '<div class="grow"><div class="name"></div><div class="meta"></div></div>';
+    row.querySelector(".name").textContent = file.name;
+    row.querySelector(".meta").textContent = bytes(file.size);
+
+    // A plain link, so the browser's own download manager handles it — which is
+    // what makes these downloads resumable for free over HTTP Range.
+    const link = document.createElement("a");
+    link.className = "btn small";
+    link.style.width = "auto";
+    link.href = "/api/download/" + encodeURIComponent(file.id);
+    link.textContent = "Save";
+    link.setAttribute("download", file.name);
+    row.appendChild(link);
+
+    $("downloads").appendChild(row);
+  }
+}
+
+/* ---------------------------------------------------------------- upload -- */
+
+/* Parallel chunk PUTs. Three is enough to keep a phone's radio busy without
+   flooding a slow uplink, and it keeps retry logic simple. */
+const PARALLEL = 3;
+
+let queued = [];      /* the File objects the user picked */
+let plan = null;      /* what the server says it still needs */
+let cancelled = false;
+
+function relativePath(file) {
+  /* Folder selections report a path; individual files do not. Strip any leading
+     component the browser invents so the server sees a clean relative path. */
+  return (file.webkitRelativePath || file.name).replace(/^\/+/, "");
+}
+
+async function startUpload(files) {
+  if (!files.length) return;
+
+  queued = files;
+  cancelled = false;
+
+  const total = files.reduce((sum, f) => sum + f.size, 0);
+  $("uploadBox").hidden = false;
+  $("upActions").hidden = true;
+  $("upName").textContent =
+    files.length === 1 ? files[0].name : files.length + " files";
+  $("upMeta").textContent = bytes(total);
+  setStatus("waiting for the other device to accept…");
+  setBar(0, "");
+
+  try {
+    const response = await api("/api/upload", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        files: files.map((f) => ({ path: relativePath(f), size: f.size })),
+      }),
+    });
+    plan = await response.json();
+  } catch (e) {
+    setStatus(String(e.message || e), "bad");
+    setBar(100, "failed");
+    return;
+  }
+
+  await sendPlan(total);
+}
+
+async function sendPlan(total) {
+  /* Work out what is left, then send it. On a resume the plan already excludes
+     everything the server has, so this is the same code either way. */
+  const byPath = new Map(queued.map((f) => [relativePath(f), f]));
+  const jobs = [];
+
+  for (const need of plan.needed) {
+    const file = byPath.get(need.path);
+    if (!file) continue;
+    for (const [start, end] of need.ranges) {
+      for (let index = start; index < end; index++) {
+        jobs.push({ file, entry: need.index, index });
+      }
+    }
+  }
+
+  const already = total - jobs.reduce((sum, job) => sum + chunkLength(job), 0);
+  let done = already;
+
+  if (already > 0) {
+    setStatus("resuming — " + bytes(already) + " already there");
+  }
+
+  let cursor = 0;
+  let failure = null;
+
+  async function worker() {
+    while (cursor < jobs.length && !cancelled && !failure) {
+      const job = jobs[cursor++];
+      try {
+        await sendChunk(job);
+        done += chunkLength(job);
+        setBar((done / total) * 100, "");
+        setStatus(bytes(done) + " of " + bytes(total));
+      } catch (e) {
+        failure = e;
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: PARALLEL }, worker));
+
+  if (failure) {
+    setStatus(
+      "stopped: " + (failure.message || failure) + " — nothing already sent was lost",
+      "bad"
+    );
+    setBar((done / total) * 100, "failed");
+    $("upActions").hidden = false;
+    return;
+  }
+  if (cancelled) return;
+
+  try {
+    const placed = await (await api("/api/upload/" + plan.transferId + "/finish", {
+      method: "POST",
+    })).json();
+    setBar(100, "done");
+    setStatus(
+      placed.length === 1
+        ? "Sent — saved as " + placed[0]
+        : "Sent " + placed.length + " files",
+      "good"
+    );
+    plan = null;
+  } catch (e) {
+    setStatus(String(e.message || e), "bad");
+    $("upActions").hidden = false;
+  }
+}
+
+function chunkLength(job) {
+  const offset = job.index * CHUNK;
+  return Math.min(CHUNK, job.file.size - offset);
+}
+
+async function sendChunk(job) {
+  const offset = job.index * CHUNK;
+  const blob = job.file.slice(offset, Math.min(offset + CHUNK, job.file.size));
+  const buffer = new Uint8Array(await blob.arrayBuffer());
+  const checksum = crc32(buffer).toString(16);
+
+  await api(
+    "/api/upload/" + plan.transferId + "/" + job.entry + "/" + job.index +
+      "?crc=" + checksum,
+    { method: "PUT", body: buffer }
+  );
+}
+
+/* Resume: ask what is still missing and send only that. */
+async function resume() {
+  if (!plan) return;
+  $("upActions").hidden = true;
+  setStatus("checking what still needs sending…");
+
+  try {
+    plan = await (await api("/api/upload/" + plan.transferId + "/status")).json();
+  } catch (e) {
+    setStatus(String(e.message || e), "bad");
+    $("upActions").hidden = false;
+    return;
+  }
+
+  await sendPlan(queued.reduce((sum, f) => sum + f.size, 0));
+}
+
+function setBar(percent, className) {
+  const bar = $("upBar");
+  bar.className = "bar " + className;
+  bar.firstElementChild.style.width = Math.min(100, Math.max(0, percent)) + "%";
+}
+
+function setStatus(text, tone) {
+  const node = $("upStatus");
+  node.textContent = text;
+  node.className = "status" + (tone ? " " + tone : "");
+}
+
+/* ------------------------------------------------------------------ text -- */
+
+async function sendText() {
+  const text = $("text").value;
+  if (!text.trim()) return;
+
+  $("sendText").disabled = true;
+  try {
+    await api("/api/text", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    $("textStatus").textContent = "Sent.";
+    $("textStatus").className = "status good";
+    $("text").value = "";
+  } catch (e) {
+    $("textStatus").textContent = String(e.message || e);
+    $("textStatus").className = "status bad";
+  } finally {
+    $("sendText").disabled = false;
+  }
+}
+
+/* --------------------------------------------------------------- wire up -- */
+
+$("pickFiles").addEventListener("click", () => $("files").click());
+$("pickFolder").addEventListener("click", () => $("folder").click());
+
+for (const id of ["files", "folder"]) {
+  $(id).addEventListener("change", (event) => {
+    startUpload(Array.from(event.target.files || []));
+    event.target.value = "";
+  });
+}
+
+$("retry").addEventListener("click", resume);
+$("sendText").addEventListener("click", sendText);
+
+/* `navigator.clipboard.writeText` needs a secure context, which plain HTTP is
+   not. Selecting the text is the honest fallback: the user copies with the
+   platform gesture they already know. */
+$("copyShared").addEventListener("click", () => {
+  const field = $("shared");
+  field.focus();
+  field.select();
+  field.setSelectionRange(0, field.value.length);
+});
+
+/* Folder picking is unavailable on iOS, so hide the button rather than offer
+   something that silently does nothing. */
+if (!("webkitdirectory" in document.createElement("input"))) {
+  $("pickFolder").hidden = true;
+}
+
+loadSession();
+</script>
+</body>
+</html>

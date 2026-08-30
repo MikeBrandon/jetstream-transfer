@@ -1,0 +1,81 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/jetstream-core",
+    "crates/jetstream-discovery",
+    "crates/jetstream-web",
+    "crates/jetstream-cli",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+authors = ["Jetstream"]
+repository = "https://github.com/jetstream-app/jetstream"
+
+[workspace.dependencies]
+jetstream-core = { path = "crates/jetstream-core" }
+jetstream-discovery = { path = "crates/jetstream-discovery" }
+jetstream-web = { path = "crates/jetstream-web" }
+
+# Async runtime
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+
+# Transport: QUIC + TLS 1.3
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+rustls-pki-types = "1"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+x509-parser = "0.18"
+
+# Hashing & serialization
+blake3 = "1.8"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1.1", features = ["use-std"] }
+serde_json = "1"
+
+zeroize = "1"
+
+# Errors & logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utility
+directories = "6"
+walkdir = "2.5"
+socket2 = { version = "0.6", features = ["all"] }
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+uninlined_format_args = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Fast dev builds while still getting usable transfer speeds from the hot paths.
+[profile.dev.package.blake3]
+opt-level = 3
+[profile.dev.package.ring]
+opt-level = 3

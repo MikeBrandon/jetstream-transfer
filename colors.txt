@@ -1,0 +1,6 @@
+#62B3C5
+#E7507E
+#FBB583
+
+Font: Nova Square
+Link: https://fonts.google.com/specimen/Nova+Square/glyphs?preview.text=Horizon%20Web%20Labs&preview.size=64&classification=Display&stroke=Sans+Serif

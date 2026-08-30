@@ -1,0 +1,35 @@
+[package]
+name = "jetstream-web"
+description = "Browser receiver for Jetstream — lets devices without the app take part"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+jetstream-core.workspace = true
+
+tokio.workspace = true
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["fs", "set-header"] }
+blake3.workspace = true
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+getrandom = "0.3"
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile = "3"
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
