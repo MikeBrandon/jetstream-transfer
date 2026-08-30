@@ -13,8 +13,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
-authors = ["Jetstream"]
-repository = "https://github.com/jetstream-app/jetstream"
+authors = ["Mike Brandon"]
+repository = "https://github.com/MikeBrandon/jetstream-transfer"
 
 [workspace.dependencies]
 jetstream-core = { path = "crates/jetstream-core" }
