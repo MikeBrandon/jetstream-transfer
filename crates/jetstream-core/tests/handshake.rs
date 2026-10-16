@@ -257,3 +257,34 @@ async fn unreachable_peers_produce_an_actionable_error() {
         "expected a transport error, got {err:?}"
     );
 }
+
+/// A probe proves the key at an address without starting a session — which is
+/// what lets a VPN peer be kept in the device list without the other side
+/// seeing a stream of empty transfers.
+#[tokio::test]
+async fn a_probe_proves_the_key_and_starts_no_session() {
+    let (prober, _, _) = spawn_device("Prober");
+    let (target, target_id, target_addr) = spawn_device("Target");
+    let (_, stranger_id, _) = spawn_device("Stranger");
+
+    let accepting = tokio::spawn({
+        let target = target.clone();
+        async move { target.accept().await }
+    });
+
+    within(prober.probe(target_addr, target_id))
+        .await
+        .expect("the right device answering should pass");
+
+    // The listener saw a connection that never became a session.
+    let accepted = within(accepting).await.unwrap();
+    assert!(
+        matches!(accepted, Some(Err(_))),
+        "a probe must not reach the application as a session"
+    );
+
+    // And the wrong key at that address is refused, as with a real connection.
+    let accepting = tokio::spawn(async move { target.accept().await });
+    assert!(within(prober.probe(target_addr, stranger_id)).await.is_err());
+    accepting.abort();
+}

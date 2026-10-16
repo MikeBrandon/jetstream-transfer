@@ -439,8 +439,9 @@ pub type SharedRegistry = Arc<Registry>;
 pub struct Discovery {
     registry: SharedRegistry,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// Held so the advertisement is withdrawn on drop.
-    _mdns: Option<Arc<mdns::Mdns>>,
+    /// Held so the advertisement is withdrawn on drop, and for renaming.
+    mdns: Option<Arc<mdns::Mdns>>,
+    broadcaster: Option<Arc<broadcast::Broadcaster>>,
 }
 
 impl Discovery {
@@ -465,7 +466,7 @@ impl Discovery {
             }
         };
 
-        match broadcast::Broadcaster::bind(device_id, name, transfer_port) {
+        let broadcaster = match broadcast::Broadcaster::bind(device_id, name, transfer_port) {
             Ok(broadcaster) => {
                 let broadcaster = Arc::new(broadcaster);
 
@@ -479,11 +480,13 @@ impl Discovery {
                 tasks.push(tokio::spawn(async move {
                     listening.listen_forever(into).await;
                 }));
+                Some(broadcaster)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "UDP broadcast unavailable; relying on mDNS only");
+                None
             }
-        }
+        };
 
         // Expire stale peers so the list reflects who is actually there.
         let expiring = Arc::clone(&registry);
@@ -501,7 +504,18 @@ impl Discovery {
         Self {
             registry,
             tasks,
-            _mdns: mdns,
+            mdns,
+            broadcaster,
+        }
+    }
+
+    /// Announce a new display name, without restarting anything.
+    pub fn rename(&self, name: &str) {
+        if let Some(broadcaster) = &self.broadcaster {
+            broadcaster.rename(name);
+        }
+        if let Some(mdns) = &self.mdns {
+            mdns.rename(name);
         }
     }
 

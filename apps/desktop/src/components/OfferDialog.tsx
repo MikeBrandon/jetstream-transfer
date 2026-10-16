@@ -44,13 +44,24 @@ export function OfferDialog({ offer, onRespond }: Props) {
         {/* `summary` already carries the size, so do not repeat it here. */}
         <p className="lede">{offer.summary}</p>
 
-        <div className="fingerprint" aria-label="Sender fingerprint">
-          {offer.fingerprintWords.map((word, index) => (
-            <span key={`${word}-${index}`}>{word}</span>
-          ))}
-        </div>
+        {/* A browser has no key, so there are no words to compare and nothing
+            to remember. Saying "check these six words" over an empty box, with
+            an "always accept" box that did nothing, was worse than silence. */}
+        {offer.browser ? (
+          <div className="first-contact">
+            This is a web browser on your network, not a Jetstream device, so
+            there is no fingerprint to check. Accept only if you are expecting
+            it — you, or someone you know, sending from a phone right now.
+          </div>
+        ) : (
+          <div className="fingerprint" aria-label="Sender fingerprint">
+            {offer.fingerprintWords.map((word, index) => (
+              <span key={`${word}-${index}`}>{word}</span>
+            ))}
+          </div>
+        )}
 
-        {offer.firstContact ? (
+        {offer.browser ? null : offer.firstContact ? (
           <div className="first-contact">
             You have not received from this device before. Check that these six words
             match what it is showing. If they do not, something else is answering in
@@ -77,15 +88,17 @@ export function OfferDialog({ offer, onRespond }: Props) {
           )}
         </div>
 
-        <label className="field" style={{ marginTop: 16, marginBottom: 0 }}>
-          <input
-            type="checkbox"
-            checked={remember}
-            onChange={(event) => setRemember(event.target.checked)}
-            style={{ width: "auto", marginRight: 8 }}
-          />
-          Always accept from {offer.peerName} without asking
-        </label>
+        {!offer.browser && (
+          <label className="field" style={{ marginTop: 16, marginBottom: 0 }}>
+            <input
+              type="checkbox"
+              checked={remember}
+              onChange={(event) => setRemember(event.target.checked)}
+              style={{ width: "auto", marginRight: 8 }}
+            />
+            Always accept from {offer.peerName} without asking
+          </label>
+        )}
 
         <div className="actions">
           <button

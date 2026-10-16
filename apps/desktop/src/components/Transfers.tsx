@@ -13,7 +13,9 @@ import type { KeyboardEvent } from "react";
 import {
   formatBytes,
   formatEta,
+  formatPercent,
   formatRate,
+  isRunning,
   type TransferView,
 } from "../api";
 
@@ -32,7 +34,9 @@ function stateLabel(transfer: TransferView): string {
     case "connecting":
       return "connecting…";
     case "waiting":
-      return transfer.direction === "sending" ? "waiting for them to accept…" : "waiting…";
+      return transfer.direction === "sending"
+        ? "waiting for them to accept…"
+        : "waiting for you to accept…";
     case "active":
       return "";
     case "done":
@@ -142,9 +146,10 @@ export function Transfers({
     );
   }
 
-  const finished = transfers.filter((t) =>
-    ["done", "failed", "rejected", "interrupted"].includes(t.state),
-  ).length;
+  // Anything not running has stopped one way or another — paused and cancelled
+  // included, which this used to miss, so "Clear finished" never offered to
+  // clear them.
+  const finished = transfers.filter((t) => !isRunning(t)).length;
 
   return (
     <>
@@ -164,12 +169,20 @@ export function Transfers({
             : transfer.state === "done"
               ? 100
               : 0;
-        const running = !["done", "failed", "rejected", "interrupted"].includes(transfer.state);
+        const percentText =
+          transfer.state === "done" ? "100%" : formatPercent(transfer.bytesDone, transfer.bytesTotal);
+        // Paused and cancelled rows used to count as running, so they kept
+        // offering Pause and Cancel buttons that did nothing.
+        const running = isRunning(transfer);
+        const sending = transfer.direction === "sending";
         const label = stateLabel(transfer);
         const { shade, chip } = tone(transfer.state);
 
         // No progress to show yet, so the bar sweeps instead of sitting at zero.
-        const pending = transfer.state === "connecting" || transfer.state === "waiting";
+        // A resumed transfer already knows how far it got, so it shows that.
+        const pending =
+          (transfer.state === "connecting" || transfer.state === "waiting") &&
+          transfer.bytesDone === 0;
         const active = transfer.state === "active";
 
         // A declined transfer never moved a byte, so "0%" is a number with
@@ -238,17 +251,28 @@ export function Transfers({
                   </select>
                 )}
 
-                {running && (
+                {/* Only the sender can pick a transfer up again, so only the
+                    sender is offered a pause. A receiver can stop; what it has
+                    is kept, and it carries on if the sender sends again. */}
+                {running && sending && (
                   <button className="btn ghost small" onClick={() => onPause(transfer.id)}>
                     Pause
                   </button>
                 )}
                 {running && (
-                  <button className="btn ghost small" onClick={() => onCancel(transfer.id)}>
-                    Cancel
+                  <button
+                    className="btn ghost small"
+                    onClick={() => onCancel(transfer.id)}
+                    title={
+                      sending
+                        ? "Stop sending. What already arrived stays on the other device."
+                        : "Stop receiving. What already arrived is kept."
+                    }
+                  >
+                    {sending ? "Cancel" : "Stop"}
                   </button>
                 )}
-                {transfer.resumable && transfer.direction === "sending" && (
+                {transfer.resumable && (
                   <button className="btn small" onClick={() => onResume(transfer)}>
                     {transfer.state === "paused" ? "Continue" : "Resume"}
                   </button>
@@ -265,9 +289,9 @@ export function Transfers({
                   className={`percent ${shade}`.trim()}
                   // Announced as one value rather than letting a screen reader
                   // read a bare number with no unit or context.
-                  aria-label={`${Math.round(percent)} percent complete`}
+                  aria-label={`${percentText} complete`}
                 >
-                  {Math.round(percent)}%
+                  {percentText}
                 </span>
               )}
             </div>
@@ -300,6 +324,14 @@ export function Transfers({
                     trailing
                   />
                 )}
+              </div>
+            )}
+
+            {/* A stopped transfer still has a size worth knowing: how far it
+                got is the difference between "start again" and "nearly there". */}
+            {!active && transfer.state !== "done" && transfer.bytesTotal > 0 && transfer.bytesDone > 0 && (
+              <div className="detail">
+                {formatBytes(transfer.bytesDone)} of {formatBytes(transfer.bytesTotal)}
               </div>
             )}
 

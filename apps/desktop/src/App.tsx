@@ -17,6 +17,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   api,
   events,
+  isRunning,
   type OfferView,
   type PeerView,
   type SelfView,
@@ -24,7 +25,8 @@ import {
   type TrustedView,
   type TrustView,
 } from "./api";
-import type { FirewallView, HistoryView, NetworkProfileView } from "./api";
+import type { FirewallView, HistoryView, NetworkProfileView, WebText } from "./api";
+import { AddDevice } from "./components/AddDevice";
 import { NetworkProfileCard } from "./components/NetworkProfileCard";
 import { History } from "./components/History";
 import { Browser } from "./components/Browser";
@@ -50,6 +52,7 @@ export function App() {
   /** Paths waiting for a device to be chosen. */
   const [pending, setPending] = useState<string[]>([]);
   const [hovering, setHovering] = useState(false);
+  const [adding, setAdding] = useState(false);
 
   // Surfaced on the main screen, not buried in the Network tab. A blocked
   // firewall means the app can send but never receive, and a first-run user
@@ -57,15 +60,21 @@ export function App() {
   const [firewall, setFirewall] = useState<FirewallView | null>(null);
   const [profile, setProfile] = useState<NetworkProfileView | null>(null);
   const [history, setHistory] = useState<HistoryView[]>([]);
+  /** Text sent from browsers this session, newest first. */
+  const [texts, setTexts] = useState<(WebText & { at: number })[]>([]);
 
   // Held in a ref as well so the drop handler, registered once, can read the
   // current value without being torn down and re-registered on every change.
   const pendingRef = useRef<string[]>([]);
   pendingRef.current = pending;
 
+  // One timer for the one toast. Each toast used to start its own, so an older
+  // one expiring could clear a newer error after a fraction of a second.
+  const toastTimer = useRef<number | undefined>(undefined);
   const say = useCallback((text: string, error = false) => {
     setToast({ text, error });
-    window.setTimeout(() => setToast(null), error ? 7000 : 3500);
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), error ? 7000 : 3500);
   }, []);
 
   const refreshTrusted = useCallback(() => {
@@ -111,6 +120,14 @@ export function App() {
       events.hiddenToTray(() =>
         say("Jetstream is still running in the notification area, ready to receive. Quit from there when you want it to stop."),
       ),
+      events.notice((text) => say(text)),
+      // Keeps the History badge and list current without a visit to the tab.
+      events.historyChanged(refreshHistory),
+      // Used to be sent and never listened for, so text from a phone vanished.
+      events.webText((text) => {
+        setTexts((current) => [{ ...text, at: Date.now() }, ...current].slice(0, 20));
+        say(`${text.from} sent you text — it is in the Phone tab.`);
+      }),
     ];
 
     return () => {
@@ -196,15 +213,13 @@ export function App() {
     [refreshTrusted],
   );
 
-  const active = transfers.filter(
-    (transfer) => !["done", "failed", "rejected", "interrupted"].includes(transfer.state),
-  ).length;
+  const active = transfers.filter(isRunning).length;
 
   const tabs: [Tab, string, number][] = [
     ["devices", "Devices", peers.length],
     ["transfers", "Transfers", active],
     ["history", "History", history.filter((r) => r.willRetry).length],
-    ["browser", "Phone", 0],
+    ["browser", "Phone", texts.length],
     ["trusted", "Paired", 0],
     ["network", "Network", 0],
     ["settings", "Settings", 0],
@@ -290,9 +305,34 @@ export function App() {
                 <button className="btn small" onClick={() => void chooseAndArm(true)}>
                   Choose folder…
                 </button>
+                <button
+                  className="btn ghost small"
+                  onClick={() => setAdding(true)}
+                  title="For a device on a VPN or another network, which will not appear by itself"
+                >
+                  Add by address…
+                </button>
               </div>
             )}
-            <Peers peers={peers} armed={pending.length > 0} onPick={(peer) => void pickPeer(peer)} />
+            {adding && (
+              <AddDevice
+                onCancel={() => setAdding(false)}
+                onAdded={(peer) => {
+                  setAdding(false);
+                  setPeers((current) => [
+                    ...current.filter((p) => p.deviceId !== peer.deviceId),
+                    peer,
+                  ]);
+                  say(`Found ${peer.name}. It will stay in the list while it can be reached.`);
+                }}
+              />
+            )}
+            <Peers
+              peers={peers}
+              armed={pending.length > 0}
+              onPick={(peer) => void pickPeer(peer)}
+              onAddByAddress={() => setAdding(true)}
+            />
           </>
         )}
 
@@ -308,13 +348,14 @@ export function App() {
             onClear={() => {
               void api.clearFinished().then(() => api.listTransfers().then(setTransfers));
             }}
+            // Continues this transfer under its own id. It used to open a file
+            // picker and start a brand-new transfer, which is exactly the
+            // "it started again from scratch" it was meant to avoid.
             onResume={(transfer) => {
-              const peer = peers.find((p) => p.deviceId === transfer.peerDeviceId);
-              if (peer) {
-                void pickPeer(peer);
-              } else {
-                say(`${transfer.peerName} is not on the network right now.`, true);
-              }
+              void api
+                .retryTransfer(transfer.id)
+                .then(refreshHistory)
+                .catch((e) => say(String(e), true));
             }}
           />
         )}
@@ -355,7 +396,13 @@ export function App() {
           />
         )}
 
-        {tab === "browser" && <Browser />}
+        {tab === "browser" && (
+          <Browser
+            texts={texts}
+            onClearTexts={() => setTexts([])}
+            onCopied={() => say("Copied.")}
+          />
+        )}
 
         {tab === "network" && <Network self={self} />}
 
@@ -366,7 +413,7 @@ export function App() {
               void api.getSelf().then(setSelf);
               say(
                 nameChanged
-                  ? "Saved. The new name will be visible to other devices after a restart."
+                  ? "Saved. Other devices will see the new name within a few seconds."
                   : "Saved.",
               );
             }}

@@ -6,8 +6,8 @@
  * differentiator, so it is worth the space it takes.
  */
 
-import { useEffect, useState } from "react";
-import { api, type DiagnosticsView, type SelfView } from "../api";
+import { useCallback, useEffect, useState } from "react";
+import { api, type DiagnosticsView, type ManualDevice, type SelfView } from "../api";
 import { FirewallCard } from "./FirewallCard";
 
 interface Props {
@@ -17,6 +17,12 @@ interface Props {
 export function Network({ self }: Props) {
   const [report, setReport] = useState<DiagnosticsView | null>(null);
   const [running, setRunning] = useState(false);
+  const [manual, setManual] = useState<ManualDevice[]>([]);
+
+  const refreshManual = useCallback(() => {
+    void api.listManualDevices().then(setManual);
+  }, []);
+  useEffect(refreshManual, [refreshManual]);
 
   const run = async () => {
     setRunning(true);
@@ -38,6 +44,8 @@ export function Network({ self }: Props) {
           canFix: false,
           summary: "Firewall state unknown.",
           remedy: String(error),
+          browserState: "unknown",
+          browserAllowed: false,
         },
       });
     } finally {
@@ -84,7 +92,42 @@ export function Network({ self }: Props) {
           <div className="selectable" style={{ fontFamily: "var(--mono)", fontSize: 12 }}>
             listening on port {self.port} · saving to {self.downloadDir}
           </div>
+          {self.addresses.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
+                Addresses — type one of these into "Add by address" on a device that
+                cannot see this one, such as across a VPN
+              </div>
+              <div className="selectable" style={{ fontFamily: "var(--mono)", fontSize: 12 }}>
+                {self.addresses.join(" · ")}
+              </div>
+            </div>
+          )}
         </div>
+      )}
+
+      {manual.length > 0 && (
+        <>
+          <h3 className="section-title" style={{ marginTop: 18 }}>
+            Added by address
+          </h3>
+          {manual.map((device) => (
+            <div className="row" key={device.deviceId}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div>{device.name}</div>
+                <div className="selectable" style={{ fontFamily: "var(--mono)", fontSize: 12, color: "var(--text-dim)" }}>
+                  {device.address}
+                </div>
+              </div>
+              <button
+                className="btn ghost small"
+                onClick={() => void api.forgetManualDevice(device.deviceId).then(refreshManual)}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+        </>
       )}
 
       {running && !report && <p className="hint">Testing the network…</p>}

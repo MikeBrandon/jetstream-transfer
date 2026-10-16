@@ -954,3 +954,14 @@ button {
     transition: none !important;
   }
 }
+
+/* A button that reads as a link inside running text. */
+button.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--brand-cyan);
+  text-decoration: underline;
+  cursor: pointer;
+}

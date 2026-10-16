@@ -192,9 +192,24 @@ function bytes(n) {
 
 async function api(path, options) {
   const response = await fetch(path, { credentials: "same-origin", ...options });
-  if (!response.ok) throw new Error((await response.text()) || response.statusText);
+  if (!response.ok) {
+    const error = new Error((await response.text()) || response.statusText);
+    error.status = response.status;
+    throw error;
+  }
   return response;
 }
+
+/* Whether a failed request is worth trying again: the network dropped (no
+   status at all), the server had a moment, or the chunk arrived damaged. A
+   refusal — expired session, stopped upload — is not, and retrying it would
+   only delay telling the user. */
+function transient(error) {
+  const status = error && error.status;
+  return status === undefined || status === 408 || status === 422 || status === 429 || status >= 500;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /* --------------------------------------------------------------- session -- */
 
@@ -325,7 +340,7 @@ async function sendPlan(total) {
     while (cursor < jobs.length && !cancelled && !failure) {
       const job = jobs[cursor++];
       try {
-        await sendChunk(job);
+        await sendChunkPatiently(job);
         done += chunkLength(job);
         setBar((done / total) * 100, "");
         setStatus(bytes(done) + " of " + bytes(total));
@@ -338,14 +353,24 @@ async function sendPlan(total) {
   await Promise.all(Array.from({ length: PARALLEL }, worker));
 
   if (failure) {
+    if (failure.status === 410) {
+      /* Stopped from the computer: say so, and do not offer to retry. */
+      setStatus(failure.message || "stopped on the other device", "bad");
+      setBar((done / total) * 100, "failed");
+      plan = null;
+      return;
+    }
     setStatus(
-      "stopped: " + (failure.message || failure) + " — nothing already sent was lost",
+      "stopped: " + (failure.message || failure) +
+        " — nothing already sent was lost. It carries on by itself when the connection is back.",
       "bad"
     );
     setBar((done / total) * 100, "failed");
     $("upActions").hidden = false;
+    waitingToResume = true;
     return;
   }
+  waitingToResume = false;
   if (cancelled) return;
 
   try {
@@ -371,6 +396,22 @@ function chunkLength(job) {
   return Math.min(CHUNK, job.file.size - offset);
 }
 
+/* A phone on Wi-Fi drops requests all the time — a weak spot, the screen
+   dimming, a hand-off between access points. One failed chunk used to stop the
+   whole upload; now it is retried with a growing pause first. */
+async function sendChunkPatiently(job) {
+  const pauses = [1000, 2000, 4000, 8000, 15000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await sendChunk(job);
+    } catch (e) {
+      if (!transient(e) || attempt >= pauses.length || cancelled) throw e;
+      setStatus("connection hiccup — trying again…");
+      await sleep(pauses[attempt]);
+    }
+  }
+}
+
 async function sendChunk(job) {
   const offset = job.index * CHUNK;
   const blob = job.file.slice(offset, Math.min(offset + CHUNK, job.file.size));
@@ -385,8 +426,10 @@ async function sendChunk(job) {
 }
 
 /* Resume: ask what is still missing and send only that. */
+let waitingToResume = false;
 async function resume() {
   if (!plan) return;
+  waitingToResume = false;
   $("upActions").hidden = true;
   setStatus("checking what still needs sending…");
 
@@ -450,6 +493,12 @@ for (const id of ["files", "folder"]) {
 }
 
 $("retry").addEventListener("click", resume);
+/* Carry on without being asked once the phone is back: when the network
+   returns, or when the page is looked at again after the screen was locked. */
+window.addEventListener("online", () => { if (waitingToResume) resume(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && waitingToResume) resume();
+});
 $("sendText").addEventListener("click", sendText);
 
 /* `navigator.clipboard.writeText` needs a secure context, which plain HTTP is

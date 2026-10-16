@@ -217,9 +217,11 @@ device list, and still *sends* — it simply never receives.
 
 Jetstream detects this on the main screen and offers **Allow through firewall**.
 That triggers a Windows permission prompt, because changing firewall settings
-always requires an administrator; accepting it adds a rule for inbound UDP only,
-which is the narrowest permission that lets transfers arrive. Nobody should have
-to find their way to Windows Security settings to make a file transfer work.
+always requires an administrator; accepting it adds two narrow rules — inbound
+UDP for transfers, and inbound TCP from the local subnet only for phone sharing,
+which is a small web server. Nobody should have to find their way to Windows
+Security settings to make a file transfer work. A copy that was allowed through
+before phone sharing had its own rule is offered the fix on the Phone tab.
 
 The CLI cannot show a permission prompt usefully, so `jet doctor` prints the
 exact `netsh` command instead.
@@ -247,8 +249,22 @@ a normal window does:
 and when that device reappears Jetstream resumes it — from the chunk it reached,
 so nothing already transferred crosses the wire twice. History shows which
 transfers are waiting, because a user who does not know this is happening will
-retry by hand or assume the transfer is lost. It gives up after five attempts
-rather than retrying a genuinely dead transfer forever.
+retry by hand or assume the transfer is lost. It gives up after five attempts in
+a row that move nothing, rather than retrying a genuinely dead transfer forever —
+an attempt that gets somewhere resets the count, so a link that drops every half
+hour still finishes.
+
+The receiving side treats the next attempt as the same transfer: the same row,
+the same history entry, the same folder, and — if it was interrupted rather than
+stopped by someone — no second accept prompt for exactly the files it already
+said yes to. Its progress picks up from what is already there.
+
+**Devices on a VPN or another network** — Radmin, Tailscale, ZeroTier, a
+different subnet — never appear by themselves, because discovery does not cross
+those links. **Add by address** on the Devices tab finds one once; from then on
+it is checked every few seconds and listed while it answers. A paired device with
+a transfer waiting to resume is checked at its last address automatically, so
+resuming across a VPN needs nothing added at all.
 
 **Right-click → Send to → Jetstream** works from Explorer, because going to the
 app first and browsing for a file you were already looking at is backwards. It is
@@ -312,7 +328,13 @@ browser's own download manager resumes them for free.
   catches that at hundreds of MB/s in plain JavaScript.
 - It is **off until switched on**, each pairing code is **single-use** and
   expires in five minutes, and a browser guest is **prompted every time** — it
-  holds no key, so there is no identity to remember.
+  holds no key, so there is no identity to remember. Opening the link does not
+  spend the code — only the page it opens does — so a QR app or chat preview that
+  fetches the link first cannot use it up. A fresh code appears by itself once
+  one is used or runs out.
+- It listens on every IPv4 interface, and on a machine with several networks
+  the Phone tab lets you pick which one the code points at — the phone has to be
+  on the same one.
 
 Native transfers keep the full guarantee: TLS 1.3, pinned Ed25519 identity, and
 BLAKE3 per chunk and per file.
@@ -323,7 +345,7 @@ BLAKE3 per chunk and per file.
 cargo test --workspace
 ```
 
-262 tests. The ones that matter most:
+Around 290 tests. The ones that matter most:
 
 - `an_interrupted_transfer_resumes_instead_of_restarting` — kill a transfer mid-flight, reconnect, verify byte-identical output
 - `resume_picks_up_from_bitmaps_written_by_a_previous_process` — resume across a process boundary
@@ -344,6 +366,14 @@ cargo test --workspace
 - `a_portable_key_is_readable_without_dpapi` — a portable identity that cannot open on the next machine is not portable
 - `an_existing_key_keeps_its_wrapping_regardless_of_the_request` — plugging a drive into a second machine must not rewrite the identity on it
 - `portable_mode_needs_the_folder_to_already_exist` — never invent the folder, or an installed copy silently loses its identity
+- `files_delivered_before_an_interruption_count_on_resume` — a resume starts from where it really was, not from what is still staged
+- `stopping_early_keeps_every_chunk_that_was_written` — an interruption keeps everything already on disk, not only the last periodic checkpoint
+- `pausing_the_sender_stops_both_ends_and_the_receiver_knows_why` — pause works from the sending side, and the other side says so
+- `the_sender_shows_what_arrived_not_what_it_buffered` — the sending device's progress is the receiver's, not QUIC's send buffer
+- `lumpy_arrivals_do_not_swing_between_zero_and_double` — the speed shown holds still
+- `an_attempt_that_moved_data_resets_the_retry_count` — a flaky link that keeps making progress keeps resuming
+- `opening_the_link_does_not_spend_the_code` — a link preview cannot use up a phone's pairing code
+- `an_older_peers_hello_still_decodes_without_the_new_capability` — mixed versions still talk
 
 ## License
 

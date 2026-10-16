@@ -27,6 +27,9 @@ pub struct SelfView {
     pub download_dir: String,
     /// Running from a `Jetstream Data` folder beside the executable.
     pub portable: bool,
+    /// This machine's IPv4 addresses, for typing into "Add by address" on a
+    /// device discovery cannot see from here.
+    pub addresses: Vec<String>,
 }
 
 /// A device on the network.
@@ -236,6 +239,9 @@ pub struct OfferView {
     pub total_bytes: u64,
     pub top_level: Vec<String>,
     pub more_top_level: bool,
+    /// From a browser rather than a Jetstream device. There is no key, so no
+    /// fingerprint to compare and nothing that could be remembered.
+    pub browser: bool,
 }
 
 /// One diagnostic result.
@@ -270,6 +276,12 @@ pub struct FirewallView {
     pub can_fix: bool,
     pub summary: String,
     pub remedy: String,
+    /// The phone-sharing rule, in the same terms as `state`. Separate because a
+    /// machine can receive from Jetstream devices perfectly well while phones
+    /// are blocked — the web server is TCP, and QUIC's rule only covers UDP.
+    pub browser_state: String,
+    /// True only when a phone on this network can reach the web server.
+    pub browser_allowed: bool,
 }
 
 /// Whether any connected network is categorised Public, and whether we can help.
@@ -338,13 +350,35 @@ impl FirewallView {
             return Self::unknown("Could not determine where Jetstream is installed.");
         };
 
-        match firewall::status(&exe) {
+        let browser_state = match firewall::browser_status(&exe) {
+            RuleStatus::Present => "present",
+            RuleStatus::Absent => "absent",
+            RuleStatus::Moved(_) => "moved",
+            RuleStatus::Disabled => "disabled",
+            RuleStatus::Unknown(_) if cfg!(windows) => "unknown",
+            RuleStatus::Unknown(_) => "unsupported",
+        };
+
+        Self {
+            browser_allowed: browser_state == "present",
+            browser_state: browser_state.into(),
+            ..Self::native(&exe)
+        }
+    }
+
+    /// The main rule, which native transfers depend on.
+    fn native(exe: &std::path::Path) -> Self {
+        use jetstream_discovery::firewall::{self, RuleStatus};
+
+        match firewall::status(exe) {
             RuleStatus::Present => Self {
                 state: "present".into(),
                 allowed: true,
                 can_fix: false,
                 summary: "Other devices are allowed to reach this one.".into(),
                 remedy: String::new(),
+                browser_state: String::new(),
+                browser_allowed: false,
             },
             RuleStatus::Absent => Self {
                 state: "absent".into(),
@@ -354,6 +388,8 @@ impl FirewallView {
                 remedy: "Jetstream can fix this for you. Windows will ask for permission, \
                          because changing firewall settings always needs an administrator."
                     .into(),
+                browser_state: String::new(),
+                browser_allowed: false,
             },
             RuleStatus::Moved(previous) => Self {
                 state: "moved".into(),
@@ -368,6 +404,8 @@ impl FirewallView {
                      rule still points at {previous}. Allowing it again updates the rule to \
                      where Jetstream is now — the old one is replaced, not added to."
                 ),
+                browser_state: String::new(),
+                browser_allowed: false,
             },
             RuleStatus::Disabled => Self {
                 state: "disabled".into(),
@@ -377,6 +415,8 @@ impl FirewallView {
                 remedy: "Someone or something disabled it. Re-enable 'Jetstream' in Windows \
                          Security > Firewall & network protection > Allow an app through firewall."
                     .into(),
+                browser_state: String::new(),
+                browser_allowed: false,
             },
             RuleStatus::Unknown(detail) => Self::unknown(&detail),
         }
@@ -389,6 +429,8 @@ impl FirewallView {
             can_fix: false,
             summary: "Could not check whether the firewall is allowing Jetstream through.".into(),
             remedy: detail.to_string(),
+            browser_state: if cfg!(windows) { "unknown" } else { "unsupported" }.into(),
+            browser_allowed: false,
         }
     }
 }
@@ -429,7 +471,19 @@ pub struct WebStatusView {
     pub qr_svg: String,
     pub expires_in: u64,
     pub guests: u64,
+    /// The address the code points at.
     pub address: String,
+    /// Every address a phone could use, for a machine on several networks.
+    pub addresses: Vec<WebAddressView>,
+}
+
+/// One network this machine can be reached on from a browser.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebAddressView {
+    pub ip: String,
+    /// The adapter's name, e.g. `Wi-Fi`. Empty when the system did not say.
+    pub interface: String,
 }
 
 impl WebStatusView {
@@ -441,6 +495,32 @@ impl WebStatusView {
             expires_in: 0,
             guests: 0,
             address: String::new(),
+            addresses: Vec::new(),
+        }
+    }
+
+    /// A running server's status, with a QR for `code` if one was just minted.
+    pub fn running(server: &jetstream_web::WebServer, code: Option<&jetstream_web::PairingCode>) -> Self {
+        Self {
+            running: true,
+            url: code.map(|code| code.url.clone()).unwrap_or_default(),
+            qr_svg: code
+                .and_then(|code| jetstream_web::qr_svg(&code.url).ok())
+                .unwrap_or_default(),
+            expires_in: code.map_or(0, |code| code.expires_in.as_secs()),
+            guests: server.guest_count() as u64,
+            address: code
+                .and_then(|code| code.url.strip_prefix("http://"))
+                .and_then(|rest| rest.split('/').next())
+                .map_or_else(|| server.address().to_string(), str::to_string),
+            addresses: server
+                .addresses()
+                .iter()
+                .map(|address| WebAddressView {
+                    ip: address.ip.to_string(),
+                    interface: address.interface.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -455,13 +535,15 @@ pub struct HistoryView {
     pub sending: bool,
     pub summary: String,
     pub bytes: u64,
-    /// `completed`, `interrupted`, `declined`, or `failed`.
+    /// `completed`, `interrupted`, `paused`, `cancelled`, `declined`, or `failed`.
     pub outcome: String,
     pub at: i64,
     /// True when the app will retry this by itself once the peer reappears.
     pub will_retry: bool,
     pub attempts: u32,
     pub detail: Option<String>,
+    /// How much had arrived when it last stopped.
+    pub transferred: u64,
     /// True when the user can retry it by hand — a send with sources we still
     /// have, whatever its outcome.
     pub can_retry: bool,
@@ -491,6 +573,7 @@ impl HistoryView {
             will_retry: record.wants_retry(),
             attempts: record.attempts,
             detail: record.detail.clone(),
+            transferred: record.transferred,
             can_retry: record.sending
                 && !record.sources.is_empty()
                 && record.outcome.can_continue(),

@@ -17,11 +17,15 @@
 //!
 //! So instead:
 //!
-//! - **The server binds only to a LAN address, never `0.0.0.0` on a routable
-//!   interface it does not own.** It is reachable from the local network and
-//!   nowhere else.
 //! - **Every session starts from a short-lived, single-use token** carried in
-//!   the QR code. Knowing the port is not enough; you need the code.
+//!   the QR code. Knowing the port is not enough; you need the code. That
+//!   token, not the choice of interface, is what keeps strangers out.
+//! - **It listens on every IPv4 interface**, so a phone can reach it on
+//!   whichever network it shares with this machine. It used to bind only the
+//!   address the default route picked, and on a machine with Ethernet, Wi-Fi
+//!   and a VPN adapter that was often not the one the phone was on — the QR
+//!   pointed somewhere the phone could not reach and scanning did nothing. The
+//!   Windows firewall rule for it admits the local subnet only.
 //! - **It is off by default.** The user turns it on when they want it, and it
 //!   stops when they close the panel.
 //! - **Nothing arrives without a prompt.** A browser guest is never trusted, no
@@ -125,6 +129,8 @@ pub trait WebHandler: Send + Sync + 'static {
 /// A running browser receiver.
 pub struct WebServer {
     address: SocketAddr,
+    /// Every address a browser might use, best first. See [`LanAddress`].
+    addresses: Vec<LanAddress>,
     sessions: Arc<Sessions>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -139,6 +145,19 @@ pub enum WebError {
     NoAddress,
 }
 
+/// One address this machine can be reached at, and the network it is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanAddress {
+    pub ip: IpAddr,
+    /// The interface name, e.g. `Wi-Fi` or `Ethernet 2`, so a person can tell
+    /// which network a code is for.
+    pub interface: String,
+}
+
+/// Port tried first, so the address a phone remembers stays the same between
+/// sessions. Any free port is used if it is taken.
+pub const PREFERRED_PORT: u16 = 4647;
+
 pub(crate) struct AppState {
     pub handler: Arc<dyn WebHandler>,
     pub sessions: Arc<Sessions>,
@@ -152,12 +171,25 @@ impl WebServer {
     /// interface: the QR code can only carry one address anyway, and listening
     /// on interfaces we are not advertising widens the exposure for nothing.
     pub async fn start(handler: Arc<dyn WebHandler>) -> Result<Self, WebError> {
-        let ip = jetstream_discovery_lan_address().ok_or(WebError::NoAddress)?;
+        Self::start_on(handler, PREFERRED_PORT).await
+    }
 
-        // Port 0: the OS picks. A fixed port would be one more thing to collide
-        // and one more thing to guess.
-        let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, 0)).await?;
-        let address = listener.local_addr()?;
+    /// Start on `port`, or on any free port if that one is taken. Port 0 always
+    /// takes any free port, which is what tests want.
+    pub async fn start_on(handler: Arc<dyn WebHandler>, port: u16) -> Result<Self, WebError> {
+        let addresses = lan_addresses();
+        let primary = addresses.first().ok_or(WebError::NoAddress)?.ip;
+
+        let any = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+        let listener = match tokio::net::TcpListener::bind(any).await {
+            Ok(listener) => listener,
+            Err(_) if port != 0 => {
+                tokio::net::TcpListener::bind(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)))
+                    .await?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let address = SocketAddr::new(primary, listener.local_addr()?.port());
 
         let sessions = Arc::new(Sessions::new());
         let state = Arc::new(AppState {
@@ -185,19 +217,33 @@ impl WebServer {
 
         Ok(Self {
             address,
+            addresses,
             sessions,
             shutdown: Some(shutdown),
             task: Some(task),
         })
     }
 
+    /// The address a QR code points at unless another is chosen.
     pub fn address(&self) -> SocketAddr {
         self.address
     }
 
+    /// Every address a browser might reach this machine at, best guess first.
+    pub fn addresses(&self) -> &[LanAddress] {
+        &self.addresses
+    }
+
     /// Mint a pairing code and the URL a browser should open.
     pub fn pairing_code(&self) -> PairingCode {
-        self.sessions.issue_code(&format!("http://{}", self.address))
+        self.pairing_code_for(self.address.ip())
+    }
+
+    /// Mint a pairing code for a particular address — the network the phone is
+    /// on, when this machine is on more than one.
+    pub fn pairing_code_for(&self, ip: IpAddr) -> PairingCode {
+        let address = SocketAddr::new(ip, self.address.port());
+        self.sessions.issue_code(&format!("http://{address}"))
     }
 
     /// How many browsers are currently connected.
@@ -225,7 +271,8 @@ impl Drop for WebServer {
     }
 }
 
-/// The LAN address a browser should be pointed at.
+/// The address the default route would use — the usual answer to "which
+/// network is the phone on".
 fn jetstream_discovery_lan_address() -> Option<IpAddr> {
     // Duplicated from `jetstream-discovery` rather than depending on it: this
     // crate has no other reason to pull in mDNS and a firewall COM binding, and
@@ -235,6 +282,48 @@ fn jetstream_discovery_lan_address() -> Option<IpAddr> {
     let address = socket.local_addr().ok()?.ip();
 
     (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+}
+
+/// Every IPv4 address a browser on some network could use, best first.
+///
+/// The default route's address leads, then private LAN addresses, then
+/// anything else routable. Self-assigned `169.254` addresses come last: they
+/// usually belong to an idle adapter, though on a direct cable they are the
+/// only option.
+fn lan_addresses() -> Vec<LanAddress> {
+    let primary = jetstream_discovery_lan_address();
+
+    let mut found: Vec<LanAddress> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|interface| match interface.ip() {
+            IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(LanAddress {
+                ip: IpAddr::V4(v4),
+                interface: interface.name,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    // The routing trick can name an address the interface list missed.
+    if let Some(primary) = primary
+        && !found.iter().any(|address| address.ip == primary)
+    {
+        found.push(LanAddress {
+            ip: primary,
+            interface: String::new(),
+        });
+    }
+
+    let rank = |address: &LanAddress| match address.ip {
+        ip if Some(ip) == primary => 0,
+        IpAddr::V4(v4) if v4.is_private() => 1,
+        IpAddr::V4(v4) if v4.is_link_local() => 3,
+        _ => 2,
+    };
+    found.sort_by_key(|address| (rank(address), address.ip));
+    found.dedup_by(|a, b| a.ip == b.ip);
+    found
 }
 
 /// Render a pairing URL as an SVG QR code, ready to drop into the UI.
@@ -268,6 +357,15 @@ mod tests {
         assert!(svg.starts_with("<?xml") || svg.starts_with("<svg"), "got: {}", &svg[..40]);
         assert!(svg.contains("#ffffff"), "needs a light quiet zone to scan");
         assert!(svg.len() > 500, "suspiciously small QR output");
+    }
+
+    #[test]
+    fn the_default_route_address_is_offered_first() {
+        let addresses = lan_addresses();
+        if let Some(primary) = jetstream_discovery_lan_address() {
+            assert_eq!(addresses.first().map(|a| a.ip), Some(primary));
+        }
+        assert!(addresses.iter().all(|a| !a.ip.is_loopback()));
     }
 
     #[test]

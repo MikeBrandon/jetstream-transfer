@@ -7,6 +7,7 @@
 
 mod commands;
 mod history;
+mod manual;
 mod sendto;
 mod state;
 mod titlebar;
@@ -96,6 +97,7 @@ pub fn run() {
             Some(vec!["--hidden"]),
         ))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // `JETSTREAM_DATA_DIR` lets two independent devices run on one
@@ -168,6 +170,13 @@ pub fn run() {
                 tauri::async_runtime::spawn(commands::watch_for_retries(handle, state));
             }
 
+            // Keep devices that discovery cannot see — added by address, or
+            // owed a resume across a VPN — listed while they answer.
+            {
+                let state = Arc::clone(&state);
+                tauri::async_runtime::spawn(commands::keep_reachable(state));
+            }
+
             // Accept inbound sessions for the life of the app.
             {
                 let handle = app.handle().clone();
@@ -184,13 +193,26 @@ pub fn run() {
                 let state = Arc::clone(&state);
                 tauri::async_runtime::spawn(async move {
                     let mut last_peers = String::new();
+                    let mut last_status = String::new();
+                    let mut last_states = Vec::new();
 
                     loop {
                         let transfers = state.transfer_views();
                         let busy = transfers.iter().any(|t| !t.state.is_finished());
 
-                        if busy {
+                        // Also whenever a row changes state by itself — a browser
+                        // upload going quiet stops being busy, and would otherwise
+                        // never reach the window.
+                        let states: Vec<_> = transfers.iter().map(|t| (t.id, t.state)).collect();
+                        if busy || states != last_states {
                             let _ = handle.emit("transfers", &transfers);
+                            last_states = states;
+                        }
+
+                        let status = tray::status_text(&transfers);
+                        if status != last_status {
+                            tray::set_status(&handle, &status);
+                            last_status = status;
                         }
 
                         // Peers change rarely, so only emit when they actually
@@ -231,6 +253,9 @@ pub fn run() {
             commands::make_network_private,
             commands::respond_to_offer,
             commands::send_to_peer,
+            commands::add_device_by_address,
+            commands::list_manual_devices,
+            commands::forget_manual_device,
             commands::start_web,
             commands::stop_web,
             commands::web_status,

@@ -25,6 +25,7 @@ pub struct Mdns {
     daemon: ServiceDaemon,
     fullname: String,
     device_id: DeviceId,
+    transfer_port: u16,
     /// Which device each advertisement belongs to.
     ///
     /// `ServiceRemoved` carries only the DNS-SD fullname, but the registry is
@@ -38,30 +39,7 @@ impl Mdns {
     pub fn start(device_id: DeviceId, name: &str, transfer_port: u16) -> Result<Self, mdns_sd::Error> {
         let daemon = ServiceDaemon::new()?;
 
-        // The instance name must be unique on the network and stable for this
-        // device. The device id's short form gives both, and unlike the display
-        // name it cannot collide when two machines are called "Laptop".
-        let instance = format!("jetstream-{}", device_id.short());
-        let hostname = format!("jetstream-{}.local.", device_id.short());
-
-        let properties = [
-            (TXT_DEVICE_ID, device_id.to_hex()),
-            (TXT_NAME, sanitize_name(name)),
-        ];
-
-        // `enable_addr_auto` lets the daemon track this machine's addresses,
-        // so a device that moves between Wi-Fi and Ethernet keeps advertising
-        // somewhere reachable instead of a stale address.
-        let service = ServiceInfo::new(
-            SERVICE_TYPE,
-            &instance,
-            &hostname,
-            (),
-            transfer_port,
-            &properties[..],
-        )?
-        .enable_addr_auto();
-
+        let service = advertisement(device_id, name, transfer_port)?;
         let fullname = service.get_fullname().to_string();
         daemon.register(service)?;
 
@@ -69,8 +47,19 @@ impl Mdns {
             daemon,
             fullname,
             device_id,
+            transfer_port,
             advertised: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Advertise a new display name. Registering the same instance again
+    /// replaces the old record and announces the change.
+    pub fn rename(&self, name: &str) {
+        let registered = advertisement(self.device_id, name, self.transfer_port)
+            .and_then(|service| self.daemon.register(service));
+        if let Err(e) = registered {
+            tracing::warn!(error = %e, "could not advertise the new name over mDNS");
+        }
     }
 
     /// Browse for peers until the task is dropped.
@@ -154,6 +143,37 @@ impl Mdns {
 
         Some(Sighting::claimed(device_id, name, addresses, Source::Mdns))
     }
+}
+
+/// This device's DNS-SD record.
+fn advertisement(
+    device_id: DeviceId,
+    name: &str,
+    transfer_port: u16,
+) -> Result<ServiceInfo, mdns_sd::Error> {
+    // The instance name must be unique on the network and stable for this
+    // device. The device id's short form gives both, and unlike the display
+    // name it cannot collide when two machines are called "Laptop".
+    let instance = format!("jetstream-{}", device_id.short());
+    let hostname = format!("jetstream-{}.local.", device_id.short());
+
+    let properties = [
+        (TXT_DEVICE_ID, device_id.to_hex()),
+        (TXT_NAME, sanitize_name(name)),
+    ];
+
+    // `enable_addr_auto` lets the daemon track this machine's addresses,
+    // so a device that moves between Wi-Fi and Ethernet keeps advertising
+    // somewhere reachable instead of a stale address.
+    Ok(ServiceInfo::new(
+        SERVICE_TYPE,
+        &instance,
+        &hostname,
+        (),
+        transfer_port,
+        &properties[..],
+    )?
+    .enable_addr_auto())
 }
 
 /// Flatten the resolved addresses, dropping duplicates and loopback.

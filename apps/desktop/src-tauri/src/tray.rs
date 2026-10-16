@@ -74,6 +74,74 @@ pub fn reveal(app: &AppHandle) {
     }
 }
 
+/// Bring the window up for something that needs an answer, without taking focus.
+///
+/// Shown and flashed rather than focused on purpose. Focus would let a keystroke
+/// meant for whatever the user was typing into land on the prompt instead — and
+/// Enter on an accept dialog is a decision nobody made.
+pub fn ask_for_attention(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+    }
+}
+
+/// Tell the user something through a system notification — but only when they
+/// are not already looking at the window, where the transfer list says it.
+///
+/// The window spends most of its life closed to the tray, which is exactly when
+/// a finished or stalled transfer otherwise goes unnoticed.
+pub fn notify(app: &AppHandle, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+
+    let looking = app
+        .get_webview_window("main")
+        .and_then(|window| window.is_focused().ok())
+        .unwrap_or(false);
+    if looking {
+        return;
+    }
+
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        tracing::debug!(error = %e, "could not show a notification");
+    }
+}
+
+/// Keep the tray tooltip saying what is happening, so hovering the icon
+/// answers "is it still going?" without opening anything.
+pub fn set_status(app: &AppHandle, text: &str) {
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(text));
+    }
+}
+
+/// The tooltip for a set of transfers.
+pub fn status_text(transfers: &[crate::views::TransferView]) -> String {
+    use crate::views::Direction;
+
+    let running: Vec<_> = transfers.iter().filter(|t| !t.state.is_finished()).collect();
+    let percent = |done: u64, total: u64| done.saturating_mul(100).checked_div(total).unwrap_or(0);
+
+    match running.as_slice() {
+        [] => "Jetstream".to_string(),
+        [one] => format!(
+            "Jetstream — {} {}: {}%",
+            match one.direction {
+                Direction::Sending => "sending to",
+                Direction::Receiving => "receiving from",
+            },
+            one.peer_name,
+            percent(one.bytes_done, one.bytes_total),
+        ),
+        several => {
+            let done: u64 = several.iter().map(|t| t.bytes_done).sum();
+            let total: u64 = several.iter().map(|t| t.bytes_total).sum();
+            format!("Jetstream — {} transfers: {}%", several.len(), percent(done, total))
+        }
+    }
+}
+
 /// Quit for real, letting in-flight work close cleanly.
 fn quit_app(app: &AppHandle) {
     let app = app.clone();

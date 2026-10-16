@@ -87,6 +87,10 @@ pub enum UploadError {
 
     #[error("{0}")]
     Invalid(String),
+
+    /// The person at the computer stopped this upload.
+    #[error("stopped on the other device — what already arrived was kept")]
+    Stopped,
 }
 
 impl Uploads {
@@ -165,6 +169,10 @@ impl Uploads {
             staging.manifest().summary().file_count,
             std::sync::atomic::Ordering::Relaxed,
         );
+        progress.files_done.store(
+            staging.files_present(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let plan = plan_for(&staging, &transfer_id);
 
@@ -216,6 +224,12 @@ impl Uploads {
 
         let mut upload = upload.lock().await;
 
+        // Cancelled from the computer's transfer list. Nothing else would stop a
+        // browser, which simply keeps sending until it is told no.
+        if upload.progress.cancelled() || upload.progress.paused() {
+            return Err(UploadError::Stopped);
+        }
+
         // The staging layer requires a BLAKE3 per chunk. Computing it here makes
         // that check a formality for this path — the end-to-end guarantee came
         // from the CRC above — but it keeps the on-disk format identical to a
@@ -229,10 +243,9 @@ impl Uploads {
             .map_err(|e| UploadError::Invalid(e.to_string()))?;
 
         if fresh {
-            upload
-                .progress
-                .bytes_done
-                .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            // Through `advance` so it counts towards the speed shown, not only
+            // towards the bar — browser uploads used to show no speed at all.
+            upload.progress.advance(data.len() as u64);
 
             // Persist the bitmap after **every** chunk, unlike the native path
             // which batches checkpoints.
@@ -388,6 +401,58 @@ mod tests {
 
     fn payload(len: usize, seed: u8) -> Vec<u8> {
         (0..len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed)).collect()
+    }
+
+    /// Cancelling a browser upload on the computer used to change nothing: the
+    /// phone kept sending and the files kept landing.
+    #[tokio::test]
+    async fn a_cancelled_upload_refuses_further_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::new();
+        let progress = Arc::new(Progress::default());
+        let data = payload(3000, 2);
+
+        let plan = uploads
+            .begin(
+                &request(&[("photo.jpg", data.len() as u64)]),
+                dir.path().to_path_buf(),
+                ConflictPolicy::Rename,
+                Arc::clone(&progress),
+            )
+            .unwrap();
+
+        progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let refused = uploads
+            .write_chunk(&plan.transfer_id, 0, 0, crate::crc32(&data), &data)
+            .await;
+        assert!(matches!(refused, Err(UploadError::Stopped)), "got {refused:?}");
+        assert!(!dir.path().join("photo.jpg").exists());
+    }
+
+    #[tokio::test]
+    async fn uploaded_bytes_count_towards_the_speed_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::new();
+        let progress = Arc::new(Progress::default());
+        let data = payload(3000, 3);
+
+        let plan = uploads
+            .begin(
+                &request(&[("photo.jpg", data.len() as u64)]),
+                dir.path().to_path_buf(),
+                ConflictPolicy::Rename,
+                Arc::clone(&progress),
+            )
+            .unwrap();
+        uploads
+            .write_chunk(&plan.transfer_id, 0, 0, crate::crc32(&data), &data)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            progress.bytes_moved.load(std::sync::atomic::Ordering::Relaxed),
+            data.len() as u64
+        );
     }
 
     #[tokio::test]
