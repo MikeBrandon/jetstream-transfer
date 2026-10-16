@@ -84,14 +84,58 @@ pub fn list_trusted(state: State<'_, Arc<AppState>>) -> Vec<TrustedView> {
         .map(|peer| peer.device_id)
         .collect();
 
+    let prefs = state.devices.all();
     state
         .trust
         .lock()
         .expect("trust poisoned")
         .devices()
         .iter()
-        .map(|device| TrustedView::new(device, online.contains(&device.device_id)))
+        .map(|device| {
+            TrustedView::new(
+                device,
+                online.contains(&device.device_id),
+                &prefs.get(&device.device_id.to_hex()).cloned().unwrap_or_default(),
+            )
+        })
         .collect()
+}
+
+/// Wake a sleeping device with a Wake-on-LAN packet.
+///
+/// Works for a device that was reached on this local network before, which is
+/// when its hardware address was learned, and whose network card is set to
+/// wake for it — most desktops on mains power are.
+#[tauri::command]
+pub fn wake_device(state: State<'_, Arc<AppState>>, device_id: String) -> Reply<()> {
+    let mac = state
+        .devices
+        .get(&device_id)
+        .mac
+        .and_then(|mac| jetstream_discovery::wol::parse_mac(&mac))
+        .ok_or("This device has not been seen on this network, so there is no address to wake.")?;
+
+    if jetstream_discovery::wol::wake(&mac) == 0 {
+        return Err("Could not send the wake-up signal on any network.".into());
+    }
+    Ok(())
+}
+
+/// Remember a device's hardware address for Wake-on-LAN, if this machine's
+/// neighbour table knows it — which it does right after talking to a device on
+/// the same network.
+fn learn_hardware_address(
+    state: &Arc<AppState>,
+    device: jetstream_core::DeviceId,
+    address: std::net::SocketAddr,
+) {
+    let state = Arc::clone(state);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(mac) = jetstream_discovery::wol::mac_for(address.ip()) {
+            let mac = jetstream_discovery::wol::format_mac(&mac);
+            state.devices.update(&device.to_hex(), |prefs| prefs.mac = Some(mac));
+        }
+    });
 }
 
 #[tauri::command]
@@ -211,6 +255,9 @@ pub fn save_settings(state: State<'_, Arc<AppState>>, settings: SettingsView) ->
     // nothing here kept them.
     current.send_limit_kbps = settings.send_limit_kbps;
     current.receive_limit_kbps = settings.receive_limit_kbps;
+    current.saving = crate::state::parse_saving(&settings.bandwidth_saving);
+    current.folder_per_device = settings.folder_per_device;
+    current.interface = crate::state::parse_interface(&settings.interface);
     current.save(&state.data_dir).map_err(|e| e.to_string())?;
 
     if name_changed {
@@ -472,7 +519,7 @@ pub async fn send_to_peer(
 /// spawned task and be released on every path out of it — including the early
 /// returns before the spawn. Missing one leaks the claim, and a leaked claim
 /// means that transfer can never auto-resume again.
-struct RetryClaim {
+pub struct RetryClaim {
     state: Arc<AppState>,
     record_id: u64,
 }
@@ -502,26 +549,85 @@ async fn start_send(
     // Claimed before the manifest walk, not after: on a 100,000-file tree that
     // walk alone can outlast the retry poll interval, which is exactly how
     // duplicate attempts got started.
-    let claim = match retry_of {
-        Some(record_id) => {
-            if !state.try_begin_retry(record_id) {
-                return Err("That transfer is already resuming.".into());
-            }
-            Some(RetryClaim {
-                state: Arc::clone(state),
-                record_id,
-            })
-        }
-        None => None,
-    };
-
-    let (peer_name, mut addresses) = reach(state, &target)?;
+    let claim = claim_retry(state, retry_of)?;
 
     let sources: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let root = common_root(&sources)?;
 
     // Built from `stat` alone, so this stays fast even on a huge folder.
     let (manifest, report) = Manifest::from_paths(&sources).map_err(|e| e.to_string())?;
+
+    launch_send(
+        app,
+        state,
+        target,
+        SendPlan {
+            sources,
+            root,
+            manifest,
+            report,
+            retryable: true,
+            done: None,
+        },
+        retry_of,
+        claim,
+    )
+    .await
+}
+
+/// Claim the right to run `retry_of`, if it is a retry. See [`RetryClaim`].
+fn claim_retry(state: &Arc<AppState>, retry_of: Option<u64>) -> Reply<Option<RetryClaim>> {
+    match retry_of {
+        Some(record_id) => {
+            if !state.try_begin_retry(record_id) {
+                return Err("That transfer is already resuming.".into());
+            }
+            Ok(Some(RetryClaim {
+                state: Arc::clone(state),
+                record_id,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Everything a send needs once its manifest exists.
+pub struct SendPlan {
+    /// What the user picked: shown in Explorer afterwards, and sent again by a
+    /// retry when `retryable`.
+    pub sources: Vec<PathBuf>,
+    /// The folder the manifest's paths hang off.
+    pub root: PathBuf,
+    pub manifest: Manifest,
+    pub report: jetstream_core::manifest::WalkReport,
+    /// Whether the retry watcher may send `sources` again on its own. Not for a
+    /// watched folder's batch of changes: sending its whole folder again would
+    /// duplicate everything at the other end. Its own watcher retries it.
+    pub retryable: bool,
+    /// Told whether the send completed, for whoever is waiting on it.
+    pub done: Option<tokio::sync::oneshot::Sender<bool>>,
+}
+
+/// Start a send whose manifest is already built.
+pub async fn launch_send(
+    app: AppHandle,
+    state: &Arc<AppState>,
+    target: jetstream_core::DeviceId,
+    plan: SendPlan,
+    retry_of: Option<u64>,
+    claim: Option<RetryClaim>,
+) -> Reply<u64> {
+    let SendPlan {
+        sources,
+        root,
+        manifest,
+        report,
+        retryable,
+        done,
+    } = plan;
+
+    let (peer_name, mut addresses) = reach(state, &target)?;
+
     if manifest.entries.is_empty() {
         return Err("Those paths contain nothing that can be sent.".into());
     }
@@ -573,6 +679,7 @@ async fn start_send(
         state.note_skipped(id, skipped);
     }
 
+    let options = state.settings.lock().expect("settings poisoned").options();
     let inner = Arc::clone(state);
     tauri::async_runtime::spawn(async move {
         // Held for the life of the attempt; dropping it re-arms auto-resume.
@@ -591,6 +698,9 @@ async fn start_send(
         {
             Ok(session) => session,
             Err(e) => {
+                if let Some(done) = done {
+                    let _ = done.send(false);
+                }
                 // For a resume, not answering is the expected way to fail — the
                 // other device is still away — and it will be tried again.
                 let (state_after, detail) = if retry_of.is_some() {
@@ -618,11 +728,13 @@ async fn start_send(
 
         // The address the connection actually used, not one of several advertised.
         inner.note_link_speed(id, session.peer().remote_address);
+        learn_hardware_address(&inner, target, session.peer().remote_address);
 
         inner.set_state(id, TransferState::Waiting, None);
         let _ = app.emit("transfers", inner.transfer_views());
 
-        let result = transfer::send(&session, &root, &manifest, Arc::clone(&progress)).await;
+        let result =
+            transfer::send_with(&session, &root, &manifest, Arc::clone(&progress), options).await;
 
         let name = &peer_name;
         let (state_after, outcome, detail) = match &result {
@@ -671,6 +783,7 @@ async fn start_send(
 
         inner.set_state(id, state_after, detail.clone());
         let transferred = inner.shown_bytes(id).map_or(0, |(done, _)| done);
+        let (seconds, average_rate) = inner.transfer_stats(id);
         // Same id as the transfer, so a retry updates its own record instead of
         // creating a sibling that also wants retrying. `record` preserves the
         // attempt count, so the cap keeps working across attempts.
@@ -678,7 +791,7 @@ async fn start_send(
             id,
             peer_device_id: target.to_hex(),
             peer_name: name.clone(),
-            sources: sources.clone(),
+            sources: if retryable { sources.clone() } else { Vec::new() },
             sending: true,
             summary: summary_for_history.clone(),
             bytes: total_bytes,
@@ -689,6 +802,8 @@ async fn start_send(
             digest: Some(digest),
             destination: None,
             transferred,
+            seconds,
+            average_rate,
         });
         // Getting somewhere is what separates a flaky link from a dead transfer.
         if progress.bytes_moved.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -707,6 +822,10 @@ async fn start_send(
                 &format!("The send to {name} stopped. It will resume by itself when {name} is back."),
             ),
             _ => {}
+        }
+
+        if let Some(done) = done {
+            let _ = done.send(result.is_ok());
         }
 
         session.close("done").await;
@@ -921,6 +1040,206 @@ pub async fn keep_reachable(state: Arc<AppState>) {
             }
         });
         futures_util::future::join_all(checks).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Watched folders
+// ---------------------------------------------------------------------------
+
+/// How often watched folders are looked at. A walk is `stat` calls only, but
+/// on a very large folder that is still worth not doing constantly.
+const FOLDER_CHECK: Duration = Duration::from_secs(30);
+
+#[tauri::command]
+pub fn list_watched_folders(state: State<'_, Arc<AppState>>) -> Vec<WatchedFolderView> {
+    state
+        .folders
+        .all()
+        .into_iter()
+        .map(|job| {
+            let (sending, waiting) = state.folder_status(job.id);
+            WatchedFolderView {
+                id: job.id,
+                folder: job.folder.display().to_string(),
+                device_id: job.device_id,
+                device_name: job.device_name,
+                enabled: job.enabled,
+                last_synced: job.last_synced,
+                problem: job.problem,
+                sending,
+                waiting: waiting as u64,
+                files_sent: job.sent.len() as u64,
+            }
+        })
+        .collect()
+}
+
+/// Start keeping `folder` sent to a device.
+///
+/// `send_existing` decides what happens to what is in the folder today: sent
+/// now, or treated as already there — for a device that has a copy, where
+/// sending it all again would duplicate every file at the other end.
+#[tauri::command]
+pub async fn add_watched_folder(
+    state: State<'_, Arc<AppState>>,
+    folder: String,
+    device_id: String,
+    send_existing: bool,
+) -> Reply<()> {
+    let folder = PathBuf::from(folder);
+    if !folder.is_dir() {
+        return Err("Choose a folder to watch.".into());
+    }
+    if folder.parent().is_none() {
+        return Err("A whole drive cannot be watched; choose a folder on it.".into());
+    }
+    let device = device_id_of(&device_id)?;
+    let device_name = reach(&state, &device)
+        .map(|(name, _)| name)
+        .or_else(|_| {
+            state
+                .trust
+                .lock()
+                .expect("trust poisoned")
+                .get(&device)
+                .map(|known| known.name.clone())
+                .ok_or("Choose a device that is on the network or paired.")
+        })?;
+
+    let already_there = if send_existing {
+        Default::default()
+    } else {
+        let walked = folder.clone();
+        let (manifest, _) = tauri::async_runtime::spawn_blocking(move || Manifest::from_paths(&[walked]))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        crate::folders::stamps(&manifest)
+    };
+
+    state.folders.add(folder, device_id, device_name, already_there);
+    state.folder_wake.notify_one();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_watched_folder(state: State<'_, Arc<AppState>>, id: u64) {
+    state.folders.remove(id);
+}
+
+#[tauri::command]
+pub fn set_watched_folder_enabled(state: State<'_, Arc<AppState>>, id: u64, enabled: bool) {
+    state.folders.update(id, |job| job.enabled = enabled);
+    if enabled {
+        state.folder_wake.notify_one();
+    }
+}
+
+#[tauri::command]
+pub fn sync_folder_now(state: State<'_, Arc<AppState>>) {
+    state.folder_wake.notify_one();
+}
+
+/// Look at every watched folder now and then, and send what changed.
+pub async fn watch_folders(app: AppHandle, state: Arc<AppState>) {
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(FOLDER_CHECK) => {}
+            () = state.folder_wake.notified() => {}
+        }
+
+        for job in state.folders.all().into_iter().filter(|job| job.enabled) {
+            if state.folder_status(job.id).0 {
+                continue;
+            }
+            check_folder(&app, &state, job).await;
+        }
+        let _ = app.emit("folders-changed", ());
+    }
+}
+
+async fn check_folder(app: &AppHandle, state: &Arc<AppState>, job: crate::folders::Job) {
+    let Ok(device) = job.device_id.parse::<jetstream_core::DeviceId>() else {
+        return;
+    };
+    let Some(root) = job.folder.parent().map(PathBuf::from) else {
+        return;
+    };
+
+    let walking = job.folder.clone();
+    let walked = match tauri::async_runtime::spawn_blocking(move || Manifest::from_paths(&[walking])).await {
+        Ok(Ok((manifest, _))) => manifest,
+        Ok(Err(e)) => {
+            state.folders.update(job.id, |job| {
+                job.problem = Some(format!("Cannot read the folder: {e}"));
+            });
+            return;
+        }
+        Err(_) => return,
+    };
+
+    let batch = job.changes(&walked);
+    state.set_folder_waiting(job.id, batch.entries.len());
+    if batch.entries.is_empty() {
+        return;
+    }
+
+    // The same batch as an attempt that did not finish continues under its id,
+    // as one transfer, rather than starting another.
+    let digest = hex::encode(batch.digest());
+    let retry_of = job
+        .pending
+        .as_ref()
+        .filter(|(pending, _)| *pending == digest)
+        .map(|(_, id)| *id)
+        .filter(|id| state.history.get(*id).is_some());
+    let Ok(claim) = claim_retry(state, retry_of) else {
+        return;
+    };
+
+    let sent = crate::folders::stamps(&batch);
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let plan = SendPlan {
+        sources: vec![job.folder.clone()],
+        root,
+        manifest: batch,
+        report: Default::default(),
+        retryable: false,
+        done: Some(done),
+    };
+
+    match launch_send(app.clone(), state, device, plan, retry_of, claim).await {
+        Ok(id) => {
+            state.folders.update(job.id, |job| {
+                job.pending = Some((digest, id));
+                job.problem = None;
+            });
+            state.set_folder_sending(job.id, true);
+
+            let state = Arc::clone(state);
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if finished.await.unwrap_or(false) {
+                    state.folders.complete(job.id, sent, crate::state::unix_now());
+                    state.set_folder_waiting(job.id, 0);
+                } else {
+                    state.folders.update(job.id, |job| {
+                        job.problem = Some(format!(
+                            "The last send to {} did not finish. It will carry on by itself.",
+                            job.device_name
+                        ));
+                    });
+                }
+                state.set_folder_sending(job.id, false);
+                let _ = app.emit("folders-changed", ());
+            });
+        }
+        Err(_) => {
+            state.folders.update(job.id, |job| {
+                job.problem = Some(format!("Waiting for {} to be reachable.", job.device_name));
+            });
+        }
     }
 }
 
@@ -1170,6 +1489,7 @@ async fn handle_incoming(
 
     let progress = Arc::new(Progress::default());
     state.apply_limit(&progress, Direction::Receiving);
+    learn_hardware_address(&state, peer.device_id, peer.remote_address);
 
     // Filled in once the offer says what this is. Nothing is added to the list
     // before then, so a connection that never offers anything — a reachability
@@ -1196,17 +1516,14 @@ async fn handle_incoming(
                 .unfinished_receive(&peer.device_id.to_hex(), &digest);
             let id = earlier.as_ref().map_or_else(|| state.next_id(), |record| record.id);
 
-            let (download_dir, conflict) = {
-                let settings = state.settings.lock().expect("settings poisoned");
-                (settings.download_dir.clone(), settings.on_conflict)
-            };
+            let conflict = state.settings.lock().expect("settings poisoned").on_conflict;
             // The partial data is wherever the first attempt put it, which is not
             // necessarily the folder the settings name today.
             let destination = earlier
                 .as_ref()
                 .and_then(|record| record.destination.clone())
                 .filter(|folder| folder.is_dir())
-                .unwrap_or(download_dir);
+                .unwrap_or_else(|| destination_for(&state, &peer.device_id.to_hex(), &peer.name));
 
             state.add_transfer(
                 id,
@@ -1326,7 +1643,8 @@ async fn handle_incoming(
         }
     };
 
-    let result = transfer::receive(&session, decide, Arc::clone(&progress)).await;
+    let options = state.settings.lock().expect("settings poisoned").options();
+    let result = transfer::receive_with(&session, decide, Arc::clone(&progress), options).await;
 
     let Some(incoming) = assigned.lock().expect("assigned poisoned").take() else {
         // Never got as far as an offer: a reachability probe, or a peer that
@@ -1358,14 +1676,18 @@ async fn handle_incoming(
             });
             state.set_reveal(id, landed.unwrap_or_else(|| incoming.destination.clone()));
 
-            (
-                TransferState::Done,
-                crate::history::Outcome::Completed,
-                Some(
-                    jetstream_core::staging::PlacementTally::of(&received.placements)
-                        .describe(),
-                ),
-            )
+            let mut detail =
+                jetstream_core::staging::PlacementTally::of(&received.placements).describe();
+            // Worth saying: it is why a large transfer finished so fast.
+            let reused = progress.bytes_reused.load(std::sync::atomic::Ordering::Relaxed);
+            if reused > 0 {
+                detail.push_str(&format!(
+                    " · {} reused from the copy already here",
+                    transfer::human_bytes(reused)
+                ));
+            }
+
+            (TransferState::Done, crate::history::Outcome::Completed, Some(detail))
         }
         Err(_) if incoming.withdrawn => (
             TransferState::Cancelled,
@@ -1407,6 +1729,7 @@ async fn handle_incoming(
 
     state.set_state(id, state_after, detail.clone());
     let transferred = state.shown_bytes(id).map_or(0, |(done, _)| done);
+    let (seconds, average_rate) = state.transfer_stats(id);
     state.history.record(crate::history::Record {
         id,
         peer_device_id: peer.device_id.to_hex(),
@@ -1422,6 +1745,8 @@ async fn handle_incoming(
         digest: Some(incoming.digest),
         destination: Some(incoming.destination),
         transferred,
+        seconds,
+        average_rate,
     });
 
     if state_after == TransferState::Done {
@@ -1431,6 +1756,38 @@ async fn handle_incoming(
     let _ = app.emit("transfers", state.transfer_views());
     let _ = app.emit("history-changed", ());
     session.close("finished").await;
+}
+
+/// Where files from a device go: its own folder if one was chosen, otherwise
+/// the download folder — in a subfolder named after the device, if that
+/// setting is on.
+pub fn destination_for(state: &AppState, device_id: &str, name: &str) -> PathBuf {
+    if let Some(folder) = state.devices.get(device_id).download_dir {
+        return folder;
+    }
+    let settings = state.settings.lock().expect("settings poisoned");
+    if settings.folder_per_device {
+        settings.download_dir.join(crate::devices::folder_name_for(name))
+    } else {
+        settings.download_dir.clone()
+    }
+}
+
+/// Choose, or clear, the folder one device's files go to.
+#[tauri::command]
+pub fn set_device_folder(
+    state: State<'_, Arc<AppState>>,
+    device_id: String,
+    folder: Option<String>,
+) -> Reply<()> {
+    let folder = folder.filter(|f| !f.trim().is_empty()).map(PathBuf::from);
+    if let Some(folder) = &folder {
+        std::fs::create_dir_all(folder)
+            .map_err(|e| format!("Cannot use {}: {e}", folder.display()))?;
+    }
+    device_id_of(&device_id)?;
+    state.devices.update(&device_id, |prefs| prefs.download_dir = folder);
+    Ok(())
 }
 
 /// What an inbound session turned out to be, once its offer arrived.

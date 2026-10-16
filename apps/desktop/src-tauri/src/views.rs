@@ -101,10 +101,18 @@ pub struct TrustedView {
     pub first_paired: i64,
     pub last_seen: i64,
     pub online: bool,
+    /// This device's own download folder, if one was chosen.
+    pub download_dir: Option<String>,
+    /// Whether its hardware address is known, so it can be woken.
+    pub can_wake: bool,
 }
 
 impl TrustedView {
-    pub fn new(device: &TrustedDevice, online: bool) -> Self {
+    pub fn new(
+        device: &TrustedDevice,
+        online: bool,
+        prefs: &crate::devices::DevicePrefs,
+    ) -> Self {
         Self {
             device_id: device.device_id.to_hex(),
             name: device.name.clone(),
@@ -113,6 +121,8 @@ impl TrustedView {
             first_paired: device.first_paired,
             last_seen: device.last_seen,
             online,
+            download_dir: prefs.download_dir.as_ref().map(|dir| dir.display().to_string()),
+            can_wake: prefs.mac.is_some(),
         }
     }
 }
@@ -220,6 +230,11 @@ pub struct TransferView {
     /// Computed here so the UI's "Resume" affordance cannot drift out of step
     /// with what the engine will actually do.
     pub resumable: bool,
+    /// Speed over the last minute, one reading a second, oldest first.
+    pub rate_history: Vec<u64>,
+    /// Bytes copied from an older copy already at the destination instead of
+    /// being sent.
+    pub reused: u64,
 }
 
 /// An incoming offer awaiting a decision.
@@ -453,6 +468,25 @@ pub struct SettingsView {
     /// Cap on incoming transfers, in kilobytes per second. 0 is no limit.
     #[serde(default)]
     pub receive_limit_kbps: u64,
+    /// When to compress and to reuse older copies: `auto` (VPN and internet
+    /// only), `always`, or `never`.
+    #[serde(default = "default_saving")]
+    pub bandwidth_saving: String,
+    /// Put each device's files in a folder named after it.
+    #[serde(default)]
+    pub folder_per_device: bool,
+    /// `classic`, the original interface, or `modern`. Classic stays the default
+    /// so nobody's app changes under them without asking.
+    #[serde(default = "default_interface")]
+    pub interface: String,
+}
+
+fn default_saving() -> String {
+    "auto".into()
+}
+
+fn default_interface() -> String {
+    "classic".into()
 }
 
 pub fn device_id_of(text: &str) -> Result<DeviceId, String> {
@@ -525,6 +559,25 @@ impl WebStatusView {
     }
 }
 
+/// A folder kept sent to a device.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchedFolderView {
+    pub id: u64,
+    pub folder: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub enabled: bool,
+    /// Unix seconds of the last completed send, 0 for never.
+    pub last_synced: i64,
+    pub problem: Option<String>,
+    /// A batch is being sent right now.
+    pub sending: bool,
+    /// Changed files found by the last look, not yet sent.
+    pub waiting: u64,
+    pub files_sent: u64,
+}
+
 /// A remembered transfer, for the history list.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -544,6 +597,10 @@ pub struct HistoryView {
     pub detail: Option<String>,
     /// How much had arrived when it last stopped.
     pub transferred: u64,
+    /// Seconds spent moving data in the last attempt.
+    pub seconds: u64,
+    /// Average speed over those seconds, bytes per second.
+    pub average_rate: u64,
     /// True when the user can retry it by hand — a send with sources we still
     /// have, whatever its outcome.
     pub can_retry: bool,
@@ -574,6 +631,8 @@ impl HistoryView {
             attempts: record.attempts,
             detail: record.detail.clone(),
             transferred: record.transferred,
+            seconds: record.seconds,
+            average_rate: record.average_rate,
             can_retry: record.sending
                 && !record.sources.is_empty()
                 && record.outcome.can_continue(),

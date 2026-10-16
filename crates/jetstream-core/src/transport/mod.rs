@@ -169,6 +169,12 @@ impl Session {
         let _ = self.connection.closed().await;
     }
 
+    /// Bytes received on this connection so far, as UDP payload — what actually
+    /// crossed the network, whatever was compressed or reused.
+    pub fn wire_bytes_received(&self) -> u64 {
+        self.connection.stats().udp_rx.bytes
+    }
+
     /// Whether the peer understands the live-status messages. See
     /// [`proto::Capabilities::live_status`].
     pub fn peer_has_live_status(&self) -> bool {

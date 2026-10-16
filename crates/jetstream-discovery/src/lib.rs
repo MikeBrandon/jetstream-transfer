@@ -33,6 +33,7 @@ pub mod firewall;
 pub mod linkspeed;
 pub mod mdns;
 pub mod netprofile;
+pub mod wol;
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;

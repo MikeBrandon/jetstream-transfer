@@ -128,6 +128,12 @@ pub struct Record {
     /// an unfinished transfer got.
     #[serde(default)]
     pub transferred: u64,
+    /// Seconds the last attempt spent moving data.
+    #[serde(default)]
+    pub seconds: u64,
+    /// Its average speed, bytes per second.
+    #[serde(default)]
+    pub average_rate: u64,
 }
 
 impl Record {
@@ -364,6 +370,8 @@ mod tests {
             digest: None,
             destination: None,
             transferred: 0,
+            seconds: 0,
+            average_rate: 0,
         }
     }
 

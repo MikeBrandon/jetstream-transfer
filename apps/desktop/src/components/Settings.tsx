@@ -12,7 +12,8 @@ import { api, type SelfView, type SettingsView } from "../api";
 
 interface Props {
   self: SelfView | null;
-  onSaved: (nameChanged: boolean) => void;
+  /** Told the saved settings, so the window can follow an interface change. */
+  onSaved: (nameChanged: boolean, saved: SettingsView) => void;
 }
 
 export function Settings({ self, onSaved }: Props) {
@@ -43,7 +44,7 @@ export function Settings({ self, onSaved }: Props) {
     setError(null);
     try {
       const nameChanged = await api.saveSettings(settings);
-      onSaved(nameChanged);
+      onSaved(nameChanged, settings);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -132,6 +133,20 @@ export function Settings({ self, onSaved }: Props) {
         </span>
       </label>
 
+      <label className="field">
+        <input
+          type="checkbox"
+          checked={settings.folderPerDevice}
+          onChange={(event) => patch({ folderPerDevice: event.target.checked })}
+          style={{ width: "auto", marginRight: 8 }}
+        />
+        Put each device's files in a folder named after it
+        <span className="hint">
+          Inside the folder above. A device can also be given a folder of its own,
+          anywhere, from the Paired tab.
+        </span>
+      </label>
+
       <h3 className="section-title" style={{ marginTop: 22 }}>
         Speed limits
       </h3>
@@ -171,6 +186,47 @@ export function Settings({ self, onSaved }: Props) {
           </label>
         ))}
       </div>
+
+      <label className="field" style={{ marginTop: 6 }}>
+        <span className="label">Save bandwidth</span>
+        <select
+          value={settings.bandwidthSaving}
+          onChange={(event) =>
+            patch({ bandwidthSaving: event.target.value as SettingsView["bandwidthSaving"] })
+          }
+        >
+          <option value="auto">Over a VPN or the internet only</option>
+          <option value="always">Always</option>
+          <option value="never">Never</option>
+        </select>
+        <span className="hint">
+          Compresses what compresses well, and when a large file is sent again,
+          reuses the parts the other device already has instead of sending them.
+          Both cost some processing on each side, which is worth it on a slow link
+          and usually not on a fast local network. Works between devices that
+          both have this version.
+        </span>
+      </label>
+
+      <h3 className="section-title" style={{ marginTop: 22 }}>
+        Appearance
+      </h3>
+
+      <label className="field">
+        <span className="label">Interface</span>
+        <select
+          value={settings.interface}
+          onChange={(event) => patch({ interface: event.target.value as SettingsView["interface"] })}
+        >
+          <option value="classic">Classic</option>
+          <option value="modern">Modern</option>
+        </select>
+        <span className="hint">
+          Modern has a side bar, a speed graph on each transfer, and the transfers
+          in progress on the main screen. Everything works the same in both, and
+          you can switch back at any time.
+        </span>
+      </label>
 
       <h3 className="section-title" style={{ marginTop: 22 }}>
         Windows

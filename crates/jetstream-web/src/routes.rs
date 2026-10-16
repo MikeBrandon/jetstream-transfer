@@ -23,6 +23,21 @@ use crate::{AppState, UploadOffer};
 /// no second build pipeline for what is a handful of screens.
 const PAGE: &str = include_str!("../assets/index.html");
 
+/// The app icon, for a phone's home screen.
+const ICON: &[u8] = include_bytes!("../assets/icon.png");
+
+/// What a phone needs to put the page on its home screen. Nothing in it is
+/// private, so it needs no session — a browser fetches it without the cookie.
+const MANIFEST: &str = r##"{
+  "name": "Jetstream",
+  "short_name": "Jetstream",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f1417",
+  "theme_color": "#0f1417",
+  "icons": [{ "src": "/icon.png", "sizes": "256x256", "type": "image/png" }]
+}"##;
+
 /// Room for one chunk plus framing overhead.
 const BODY_LIMIT: usize = CHUNK_SIZE as usize + 64 * 1024;
 
@@ -33,6 +48,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/j/{token}", get(arrive).post(redeem))
         .route("/", get(page))
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/icon.png", get(icon))
         .route("/api/session", get(session_info))
         .route("/api/upload", post(begin_upload))
         .route("/api/upload/{transfer}/status", get(upload_status))
@@ -124,6 +141,21 @@ async fn page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
         return (StatusCode::FORBIDDEN, Html(expired_page())).into_response();
     }
     Html(PAGE).into_response()
+}
+
+async fn manifest() -> Response {
+    ([(header::CONTENT_TYPE, "application/manifest+json")], MANIFEST).into_response()
+}
+
+async fn icon() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "max-age=86400"),
+        ],
+        ICON,
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]

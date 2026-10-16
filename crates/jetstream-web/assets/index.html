@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0f1417">
+<!-- Add to Home Screen: an icon and a name, so a phone that uses this often
+     gets a proper shortcut rather than a screenshot of the page. -->
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="icon" href="/icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Jetstream">
 <title>Jetstream</title>
 <!--
   The browser client.
@@ -223,20 +231,58 @@ async function loadSession() {
     document.title = "Jetstream — " + info.deviceName;
 
     renderDownloads(info.files || []);
-
-    if (info.sharedText) {
-      $("sharedSection").hidden = false;
-      $("shared").value = info.sharedText;
-    }
+    renderShared(info.sharedText || "");
+    return true;
   } catch (e) {
     $("to").textContent = "this link has expired — scan the code again";
+    return false;
   }
 }
 
-function renderDownloads(files) {
-  if (!files.length) return;
+/* Files and text offered from the computer used to appear only when the page
+   was first opened, so anything added afterwards needed a fresh scan. Look
+   again every few seconds while the page is being looked at. */
+const REFRESH_EVERY = 4000;
+let refreshing = null;
 
-  $("downloadSection").hidden = false;
+function keepFresh() {
+  if (refreshing || document.visibilityState !== "visible") return;
+  refreshing = setInterval(async () => {
+    if (document.visibilityState !== "visible") {
+      clearInterval(refreshing);
+      refreshing = null;
+      return;
+    }
+    if (!(await loadSession())) {
+      clearInterval(refreshing);
+      refreshing = null;
+    }
+  }, REFRESH_EVERY);
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    loadSession();
+    keepFresh();
+  }
+});
+
+let shownShared = "";
+function renderShared(text) {
+  $("sharedSection").hidden = !text;
+  // Do not replace the text under someone who is selecting it.
+  if (text !== shownShared && document.activeElement !== $("shared")) {
+    $("shared").value = text;
+    shownShared = text;
+  }
+}
+
+let shownFiles = "";
+function renderDownloads(files) {
+  const signature = JSON.stringify(files.map((f) => [f.id, f.size]));
+  if (signature === shownFiles) return;
+  shownFiles = signature;
+
+  $("downloadSection").hidden = !files.length;
   $("downloads").innerHTML = "";
 
   for (const file of files) {
@@ -518,6 +564,7 @@ if (!("webkitdirectory" in document.createElement("input"))) {
 }
 
 loadSession();
+keepFresh();
 </script>
 </body>
 </html>

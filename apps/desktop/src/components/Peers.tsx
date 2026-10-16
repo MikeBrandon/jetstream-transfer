@@ -18,9 +18,19 @@ interface Props {
   armed: boolean;
   onPick: (peer: PeerView) => void;
   onAddByAddress: () => void;
+  /** Choosing several devices for one send: clicks select instead of send. */
+  selecting?: boolean;
+  selected?: Set<string>;
 }
 
-export function Peers({ peers, armed, onPick, onAddByAddress }: Props) {
+export function Peers({
+  peers,
+  armed,
+  onPick,
+  onAddByAddress,
+  selecting = false,
+  selected = new Set(),
+}: Props) {
   if (peers.length === 0) {
     return (
       <div className="empty">
@@ -44,19 +54,25 @@ export function Peers({ peers, armed, onPick, onAddByAddress }: Props) {
   return (
     <>
       <h3 className="section-title">
-        {armed ? "Choose where to send" : `${peers.length} device${peers.length === 1 ? "" : "s"} nearby`}
+        {selecting
+          ? "Choose the devices to send to"
+          : armed
+            ? "Choose where to send"
+            : `${peers.length} device${peers.length === 1 ? "" : "s"} nearby`}
       </h3>
       <div className="grid">
         {peers.map((peer) => {
           const label = trustLabel(peer.trust);
           const blocked = peer.trust === "blocked";
+          const chosen = selecting && selected.has(peer.deviceId);
 
           return (
             <button
               key={peer.deviceId}
-              className={`peer${armed && !blocked ? " armed" : ""}`}
+              className={`peer${armed && !blocked && !selecting ? " armed" : ""}${chosen ? " chosen" : ""}`}
               onClick={() => onPick(peer)}
               disabled={blocked}
+              aria-pressed={selecting ? chosen : undefined}
               title={
                 blocked
                   ? "This device is blocked. Unblock it in the Paired tab to send to it."
@@ -64,6 +80,11 @@ export function Peers({ peers, armed, onPick, onAddByAddress }: Props) {
               }
               style={blocked ? { opacity: 0.45, cursor: "not-allowed" } : undefined}
             >
+              {selecting && !blocked && (
+                <span className="check" aria-hidden="true">
+                  {chosen ? "✓" : ""}
+                </span>
+              )}
               <div
                 className="avatar"
                 style={{ background: peerColor(peer.deviceId) }}

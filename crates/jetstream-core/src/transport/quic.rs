@@ -374,8 +374,10 @@ fn bind_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
 /// Private, link-local and loopback addresses are a LAN. Everything else —
 /// including Radmin's `26.0.0.0/8` and Tailscale's `100.64.0.0/10`, which are
 /// how VPN peers usually appear — is treated as a path that leaves the building.
-fn is_lan(addr: SocketAddr) -> bool {
-    match addr.ip() {
+pub fn is_lan(addr: SocketAddr) -> bool {
+    // A dual-stack socket reports an IPv4 peer as `::ffff:a.b.c.d`; judge the
+    // IPv4 address inside, or every LAN peer that dialled us looks remote.
+    match addr.ip().to_canonical() {
         std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
         std::net::IpAddr::V6(v6) => {
             let first = v6.segments()[0];
@@ -444,6 +446,7 @@ mod lan_tests {
             "127.0.0.1:4646",
             "[fe80::1]:4646",
             "[fd12:3456::1]:4646",
+            "[::ffff:192.168.1.20]:4646",
         ] {
             assert!(is_lan(lan.parse().unwrap()), "{lan} is a LAN address");
         }

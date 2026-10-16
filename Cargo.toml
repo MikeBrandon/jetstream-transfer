@@ -43,6 +43,7 @@ x509-parser = "0.18"
 
 # Hashing & serialization
 blake3 = "1.8"
+zstd = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["use-std"] }
 serde_json = "1"

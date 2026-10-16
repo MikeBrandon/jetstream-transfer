@@ -18,6 +18,7 @@ import {
   isRunning,
   type TransferView,
 } from "../api";
+import { Sparkline } from "./Sparkline";
 
 interface Props {
   transfers: TransferView[];
@@ -27,6 +28,8 @@ interface Props {
   onLimit: (id: number, kbps: number) => void;
   onClear: () => void;
   onResume: (transfer: TransferView) => void;
+  /** The modern interface, which adds a speed graph to each running row. */
+  modern?: boolean;
 }
 
 function stateLabel(transfer: TransferView): string {
@@ -136,6 +139,7 @@ export function Transfers({
   onLimit,
   onClear,
   onResume,
+  modern = false,
 }: Props) {
   if (transfers.length === 0) {
     return (
@@ -298,6 +302,11 @@ export function Transfers({
 
             {active && (
               <div className="stats">
+                {modern && (
+                  <div className="stat graph">
+                    <Sparkline values={transfer.rateHistory} />
+                  </div>
+                )}
                 <Stat
                   label="Speed"
                   value={transfer.rate > 0 ? formatRate(transfer.rate) : "—"}
@@ -332,6 +341,12 @@ export function Transfers({
             {!active && transfer.state !== "done" && transfer.bytesTotal > 0 && transfer.bytesDone > 0 && (
               <div className="detail">
                 {formatBytes(transfer.bytesDone)} of {formatBytes(transfer.bytesTotal)}
+              </div>
+            )}
+
+            {transfer.reused > 0 && transfer.state !== "done" && (
+              <div className="detail">
+                {formatBytes(transfer.reused)} reused from the copy already there
               </div>
             )}
 

@@ -9,7 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use jetstream_core::identity::{Identity, store};
 use jetstream_core::rate::RateMeter;
 use jetstream_core::staging::ConflictPolicy;
-use jetstream_core::transfer::Progress;
+use jetstream_core::transfer::{Options, Progress, Saving};
 use jetstream_core::transport::Endpoint;
 use jetstream_core::trust::TrustStore;
 use jetstream_core::{DEFAULT_PORT, DeviceId, default_device_name};
@@ -23,6 +23,9 @@ use crate::views::{Direction, SettingsView, TransferState, TransferView};
 /// A phone gives no signal when it goes — the tab closes, the screen locks, it
 /// walks out of range — so without this its row sat at "active" for ever.
 const BROWSER_STALL: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Speed readings kept for the graph: one a second, for the last minute.
+const RATE_HISTORY: usize = 60;
 
 pub struct AppState {
     pub identity: Arc<Identity>,
@@ -58,6 +61,16 @@ pub struct AppState {
 
     /// Devices the user added by address. See [`crate::manual`].
     pub manual: crate::manual::ManualPeers,
+    /// Per-device download folders and wake addresses. See [`crate::devices`].
+    pub devices: crate::devices::DevicePrefsStore,
+
+    /// Folders kept sent to a device. See [`crate::folders`].
+    pub folders: crate::folders::Folders,
+    /// Wakes the folder watcher early, for "Sync now" and new folders.
+    pub folder_wake: tokio::sync::Notify,
+    /// Per watched folder: whether a batch is being sent, and how many changed
+    /// files the last look found.
+    folder_status: Mutex<HashMap<u64, (bool, usize)>>,
 
     /// History records whose automatic retry is running right now.
     ///
@@ -88,6 +101,11 @@ pub struct Settings {
     /// Kilobytes per second; 0 means no limit.
     pub send_limit_kbps: u64,
     pub receive_limit_kbps: u64,
+    pub saving: Saving,
+    /// Put each device's files in a folder named after it.
+    pub folder_per_device: bool,
+    /// `classic` or `modern`. Only the window reads it.
+    pub interface: String,
 }
 
 impl Settings {
@@ -110,6 +128,9 @@ impl Settings {
                 on_conflict: parse_conflict(&view.on_conflict),
                 send_limit_kbps: view.send_limit_kbps,
                 receive_limit_kbps: view.receive_limit_kbps,
+                saving: parse_saving(&view.bandwidth_saving),
+                folder_per_device: view.folder_per_device,
+                interface: parse_interface(&view.interface),
             },
             None => Self::default(),
         }
@@ -135,6 +156,21 @@ impl Settings {
             .to_string(),
             send_limit_kbps: self.send_limit_kbps,
             receive_limit_kbps: self.receive_limit_kbps,
+            bandwidth_saving: match self.saving {
+                Saving::Auto => "auto",
+                Saving::Always => "always",
+                Saving::Never => "never",
+            }
+            .to_string(),
+            folder_per_device: self.folder_per_device,
+            interface: self.interface.clone(),
+        }
+    }
+
+    /// Transfer options that follow from these settings.
+    pub fn options(&self) -> Options {
+        Options {
+            saving: self.saving,
         }
     }
 
@@ -159,8 +195,24 @@ impl Default for Settings {
             // back — not a default that quietly makes everything slower.
             send_limit_kbps: 0,
             receive_limit_kbps: 0,
+            saving: Saving::Auto,
+            folder_per_device: false,
+            interface: "classic".into(),
         }
     }
+}
+
+pub fn parse_saving(text: &str) -> Saving {
+    match text {
+        "always" => Saving::Always,
+        "never" => Saving::Never,
+        _ => Saving::Auto,
+    }
+}
+
+/// Only the two known interfaces; anything else is the classic one.
+pub fn parse_interface(text: &str) -> String {
+    if text == "modern" { "modern" } else { "classic" }.to_string()
 }
 
 pub fn parse_conflict(text: &str) -> ConflictPolicy {
@@ -234,6 +286,14 @@ pub struct Transfer {
     /// When bytes last moved, and the count then — for noticing a browser that
     /// has gone quiet.
     last_moved: (Instant, u64),
+    /// Recent speed, one reading a second, oldest first.
+    rate_history: std::collections::VecDeque<u64>,
+    last_rate_point: Instant,
+    /// Time spent actually moving data, across pauses in this attempt — what an
+    /// average speed should be measured over, rather than time spent waiting
+    /// for someone to click Accept.
+    active_time: std::time::Duration,
+    active_since: Option<Instant>,
 }
 
 impl Transfer {
@@ -290,7 +350,33 @@ impl Transfer {
             // Only the sender holds the data, so only it can pick a transfer up
             // again. A receive continues when the sender comes back.
             resumable: self.direction == Direction::Sending && self.state.is_resumable(),
+            rate_history: self.rate_history.iter().copied().collect(),
+            reused: self.progress.bytes_reused.load(Ordering::Relaxed),
         }
+    }
+
+    fn start_active(&mut self, now: Instant) {
+        if self.active_since.is_none() {
+            self.active_since = Some(now);
+        }
+    }
+
+    fn stop_active(&mut self, now: Instant) {
+        if let Some(since) = self.active_since.take() {
+            self.active_time += now.saturating_duration_since(since);
+        }
+    }
+
+    /// Seconds spent moving data, and the average speed over them.
+    fn stats(&self) -> (u64, u64) {
+        let active = self.active_time
+            + self
+                .active_since
+                .map_or(std::time::Duration::ZERO, |since| since.elapsed());
+        let moved = self.progress.bytes_moved.load(Ordering::Relaxed);
+        let seconds = active.as_secs_f64();
+        let average = if seconds >= 0.5 { (moved as f64 / seconds) as u64 } else { 0 };
+        (active.as_secs().max(u64::from(moved > 0)), average)
     }
 
     fn sample(&mut self) {
@@ -309,6 +395,7 @@ impl Transfer {
                 TransferState::Interrupted if fresh => {
                     self.state = TransferState::Active;
                     self.detail = None;
+                    self.start_active(now);
                 }
                 TransferState::Active if now.duration_since(self.last_moved.0) > BROWSER_STALL => {
                     self.state = TransferState::Interrupted;
@@ -317,6 +404,7 @@ impl Transfer {
                         self.peer_name
                     ));
                     self.meter.reset();
+                    self.stop_active(now);
                 }
                 _ => {}
             }
@@ -336,8 +424,19 @@ impl Transfer {
         {
             self.state = TransferState::Active;
         }
+        if self.state == TransferState::Active {
+            self.start_active(now);
+        }
 
         self.meter.update(now, moved);
+
+        if now.saturating_duration_since(self.last_rate_point) >= std::time::Duration::from_secs(1) {
+            self.last_rate_point = now;
+            self.rate_history.push_back(self.meter.rate());
+            while self.rate_history.len() > RATE_HISTORY {
+                self.rate_history.pop_front();
+            }
+        }
     }
 }
 
@@ -394,6 +493,10 @@ impl AppState {
             history,
             first_hide_done: std::sync::atomic::AtomicBool::new(false),
             manual: crate::manual::ManualPeers::load(&data_dir_for_history),
+            devices: crate::devices::DevicePrefsStore::load(&data_dir_for_history),
+            folders: crate::folders::Folders::load(&data_dir_for_history),
+            folder_wake: tokio::sync::Notify::new(),
+            folder_status: Mutex::new(HashMap::new()),
             portable,
             retrying: Mutex::new(HashSet::new()),
         }))
@@ -415,6 +518,27 @@ impl AppState {
             .lock()
             .expect("retrying poisoned")
             .remove(&record_id);
+    }
+
+    /// Whether a watched folder's batch is being sent, and how many changes the
+    /// last look found.
+    pub fn folder_status(&self, id: u64) -> (bool, usize) {
+        self.folder_status
+            .lock()
+            .expect("folder status poisoned")
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn set_folder_sending(&self, id: u64, sending: bool) {
+        let mut status = self.folder_status.lock().expect("folder status poisoned");
+        status.entry(id).or_default().0 = sending;
+    }
+
+    pub fn set_folder_waiting(&self, id: u64, changes: usize) {
+        let mut status = self.folder_status.lock().expect("folder status poisoned");
+        status.entry(id).or_default().1 = changes;
     }
 
     /// True the first time the window is hidden rather than closed, so the app
@@ -466,8 +590,21 @@ impl AppState {
                 link_bps: None,
                 browser: false,
                 last_moved: (Instant::now(), 0),
+                rate_history: std::collections::VecDeque::with_capacity(RATE_HISTORY),
+                last_rate_point: Instant::now(),
+                active_time: std::time::Duration::ZERO,
+                active_since: None,
             },
         );
+    }
+
+    /// Seconds spent moving data and the average speed, for history.
+    pub fn transfer_stats(&self, id: u64) -> (u64, u64) {
+        self.transfers
+            .lock()
+            .expect("transfers poisoned")
+            .get(&id)
+            .map_or((0, 0), Transfer::stats)
     }
 
     /// Mark a row as a browser upload. See [`Transfer::browser`].
@@ -550,6 +687,10 @@ impl AppState {
             // row appeared — an accept prompt can sit open for minutes.
             if state == TransferState::Active {
                 transfer.last_moved.0 = Instant::now();
+                transfer.start_active(Instant::now());
+            }
+            if state.is_finished() {
+                transfer.stop_active(Instant::now());
             }
             if state.is_finished() {
                 transfer.final_bytes = Some(transfer.bytes());

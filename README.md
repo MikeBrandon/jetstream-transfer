@@ -271,6 +271,44 @@ app first and browsing for a file you were already looking at is backwards. It i
 a per-user shortcut, so unlike the firewall rule it needs no administrator
 rights.
 
+## Getting more done with less
+
+- **Saving bandwidth.** Over a VPN or the internet, chunks that compress well
+  are sent zstd-compressed, and already-compressed formats (photos, video,
+  archives) are left alone. When a large file is sent again and the receiver
+  still has the older copy, every unchanged 1 MiB chunk is copied locally
+  instead of crossing the network — re-sending a 20 GB disk image that changed
+  a little costs the change, not the image. Both are verified exactly like a
+  received chunk. On a local network both are off by default, because there the
+  network is rarely the slow part; Settings → Save bandwidth changes that.
+- **Watched folders.** Keep a folder sent to a device: new and changed files go
+  by themselves, nothing is ever deleted at the other end, and an interrupted
+  batch resumes like any other transfer.
+- **Several devices at once.** With files chosen, *Send to several…* sends them
+  to every device picked, each as its own resumable transfer.
+- **A folder per device.** Give a paired device its own download folder, or put
+  each device's files in a subfolder named after it.
+- **Wake-on-LAN.** A paired PC seen on this network before can be woken from the
+  Paired tab.
+- **History says how fast.** Each entry records how long it took and its
+  average speed, measured over the time data was actually moving.
+- **Phones keep up.** Files and text offered from the computer appear on an open
+  phone page without scanning again, and the page can be added to the home
+  screen.
+
+### Two interfaces
+
+Settings → Appearance → Interface switches between **Classic**, the original,
+and **Modern**: a side bar, a drop area, the transfers in progress on the main
+screen, a speed graph on each running transfer, and history grouped by day.
+Classic stays the default and is unchanged; everything works the same in both.
+
+### Mixed versions
+
+New capabilities are negotiated in the handshake, and an older build is simply
+never sent anything it does not understand — two devices on different versions
+still transfer, using what both support.
+
 ## Where the throughput came from
 
 Every change below was made because a measurement pointed at it, and two
@@ -345,7 +383,7 @@ BLAKE3 per chunk and per file.
 cargo test --workspace
 ```
 
-Around 290 tests. The ones that matter most:
+Around 300 tests. The ones that matter most:
 
 - `an_interrupted_transfer_resumes_instead_of_restarting` — kill a transfer mid-flight, reconnect, verify byte-identical output
 - `resume_picks_up_from_bitmaps_written_by_a_previous_process` — resume across a process boundary
@@ -374,6 +412,9 @@ Around 290 tests. The ones that matter most:
 - `an_attempt_that_moved_data_resets_the_retry_count` — a flaky link that keeps making progress keeps resuming
 - `opening_the_link_does_not_spend_the_code` — a link preview cannot use up a phone's pairing code
 - `an_older_peers_hello_still_decodes_without_the_new_capability` — mixed versions still talk
+- `an_older_copy_at_the_destination_supplies_the_unchanged_chunks` — re-sending a changed file sends the change
+- `compressible_data_crosses_the_wire_compressed_and_arrives_intact` — compression on the wire, nothing changed on disk
+- `only_new_and_changed_files_are_sent` — a watched folder never sends what is already there, and never deletes
 
 ## License
 

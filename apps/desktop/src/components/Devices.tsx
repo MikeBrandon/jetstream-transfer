@@ -6,6 +6,8 @@
  * later becomes suspicious of an entry can verify it rather than guess.
  */
 
+import { open } from "@tauri-apps/plugin-dialog";
+
 import {
   formatWhen,
   initials,
@@ -18,9 +20,12 @@ interface Props {
   devices: TrustedView[];
   onSetTrust: (device: TrustedView, trust: TrustView) => void;
   onForget: (device: TrustedView) => void;
+  /** Choose a folder for this device's files, or null for the usual one. */
+  onSetFolder: (device: TrustedView, folder: string | null) => void;
+  onWake: (device: TrustedView) => void;
 }
 
-export function Devices({ devices, onSetTrust, onForget }: Props) {
+export function Devices({ devices, onSetTrust, onForget, onSetFolder, onWake }: Props) {
   if (devices.length === 0) {
     return (
       <div className="empty">
@@ -76,7 +81,51 @@ export function Devices({ devices, onSetTrust, onForget }: Props) {
             <div style={{ fontSize: 11, color: "var(--text-faint)" }}>
               paired {formatWhen(device.firstPaired)} · last seen {formatWhen(device.lastSeen)}
             </div>
+            {/* Where this device's files go. A per-device folder keeps one
+                person's photos out of another's downloads without anyone having
+                to sort them afterwards. */}
+            <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 3 }}>
+              Files go to{" "}
+              {device.downloadDir ? (
+                <span className="selectable" style={{ fontFamily: "var(--mono)" }}>
+                  {device.downloadDir}
+                </span>
+              ) : (
+                "the usual folder"
+              )}
+              {" · "}
+              <button
+                className="link"
+                onClick={() => {
+                  void open({ directory: true, multiple: false }).then((picked) => {
+                    if (typeof picked === "string") onSetFolder(device, picked);
+                  });
+                }}
+              >
+                change
+              </button>
+              {device.downloadDir && (
+                <>
+                  {" · "}
+                  <button className="link" onClick={() => onSetFolder(device, null)}>
+                    use the usual folder
+                  </button>
+                </>
+              )}
+            </div>
           </div>
+
+          {/* Only offered for a device seen on this network before, which is
+              when its hardware address was learned. */}
+          {!device.online && device.canWake && (
+            <button
+              className="btn small"
+              onClick={() => onWake(device)}
+              title="Send a Wake-on-LAN signal. Works if its network card is set to wake for one."
+            >
+              Wake
+            </button>
+          )}
 
           <select
             value={device.trust}

@@ -6,6 +6,8 @@
 //! because the CLI has to be able to reproduce any bug without a UI attached.
 
 mod commands;
+mod devices;
+mod folders;
 mod history;
 mod manual;
 mod sendto;
@@ -170,6 +172,13 @@ pub fn run() {
                 tauri::async_runtime::spawn(commands::watch_for_retries(handle, state));
             }
 
+            // Send changes in watched folders.
+            {
+                let handle = app.handle().clone();
+                let state = Arc::clone(&state);
+                tauri::async_runtime::spawn(commands::watch_folders(handle, state));
+            }
+
             // Keep devices that discovery cannot see — added by address, or
             // owed a resume across a VPN — listed while they answer.
             {
@@ -254,6 +263,13 @@ pub fn run() {
             commands::respond_to_offer,
             commands::send_to_peer,
             commands::add_device_by_address,
+            commands::set_device_folder,
+            commands::wake_device,
+            commands::list_watched_folders,
+            commands::add_watched_folder,
+            commands::remove_watched_folder,
+            commands::set_watched_folder_enabled,
+            commands::sync_folder_now,
             commands::list_manual_devices,
             commands::forget_manual_device,
             commands::start_web,
