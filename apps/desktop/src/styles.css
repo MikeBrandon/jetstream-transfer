@@ -926,6 +926,14 @@ button {
   margin-top: 5px;
 }
 
+/* After a checkbox the hint is on a line of its own, under the label text. As
+   an inline span it ran straight on from the label: "…when I sign inJetstream
+   has to be running…". */
+.field > input[type="checkbox"] ~ .hint {
+  display: block;
+  margin-left: 24px;
+}
+
 .selectable {
   user-select: text;
 }
@@ -964,4 +972,360 @@ button.link {
   color: var(--brand-cyan);
   text-decoration: underline;
   cursor: pointer;
+}
+
+/* Choosing several devices for one send. The check sits where the eye lands
+   first on a tile, and a chosen tile is outlined like an armed one. */
+.peer .check {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  border: 1.5px solid var(--line-strong);
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  color: #08161a;
+}
+
+.peer.chosen {
+  border-color: var(--brand-cyan);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand-cyan) 22%, transparent);
+}
+
+.peer.chosen .check {
+  background: var(--brand-cyan);
+  border-color: var(--brand-cyan);
+}
+
+/* --- speed graph (modern interface) --------------------------------------- */
+
+.stat.graph {
+  flex: 1 1 140px;
+  min-width: 120px;
+}
+
+.sparkline {
+  position: relative;
+  height: 36px;
+  width: 100%;
+  cursor: crosshair;
+}
+
+.sparkline svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  overflow: visible;
+}
+
+.sparkline .line {
+  fill: none;
+  stroke: var(--brand-cyan);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.sparkline .area {
+  fill: color-mix(in srgb, var(--brand-cyan) 16%, transparent);
+  stroke: none;
+}
+
+.sparkline .base,
+.sparkline .cross {
+  stroke: var(--line-strong);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.sparkline-tip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.sparkline-tip span {
+  margin-left: 6px;
+  color: var(--text-faint);
+}
+
+/* History grouped by day (modern interface). */
+.day-heading {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin: 16px 2px 8px;
+}
+
+/* ========================================================================= *
+ * The modern interface.                                                     *
+ *                                                                           *
+ * Opt-in from Settings → Appearance, and everything below is scoped to      *
+ * `.app.modern`, so the classic interface is exactly what it always was.    *
+ * Same colours and type; more room, a side bar instead of a tab strip, and  *
+ * the work in progress kept in view on the main screen.                     *
+ * ========================================================================= */
+
+.app.modern {
+  grid-template-columns: 216px minmax(0, 1fr);
+  grid-template-rows: 1fr;
+}
+
+.app.modern .sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 18px 12px 14px;
+  background: var(--bg-raised);
+  border-right: 1px solid var(--line);
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.app.modern .sidebar .wordmark {
+  padding: 4px 10px;
+}
+
+.app.modern .tabs {
+  flex-direction: column;
+  background: none;
+  padding: 0;
+  gap: 2px;
+}
+
+.app.modern .tab {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 11px;
+  border-radius: 9px;
+  text-align: left;
+  font-size: 13.5px;
+}
+
+.app.modern .tab:hover {
+  background: var(--bg-hover);
+}
+
+.app.modern .tab[aria-selected="true"] {
+  background: color-mix(in srgb, var(--brand-cyan) 15%, transparent);
+  color: var(--text);
+  box-shadow: none;
+}
+
+.app.modern .tab[aria-selected="true"] .nav-icon {
+  color: var(--on-cyan);
+}
+
+.app.modern .tab .count {
+  margin-left: auto;
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--brand-cyan) 18%, transparent);
+  text-align: center;
+  line-height: 18px;
+}
+
+.app.modern .sidebar .identity {
+  margin-top: auto;
+  margin-left: 0;
+  text-align: left;
+  padding: 12px 10px 2px;
+  border-top: 1px solid var(--line);
+}
+
+.app.modern .body {
+  padding: 26px 30px 40px;
+}
+
+.app.modern .body > * {
+  max-width: 1040px;
+}
+
+/* --- the drop area: what to send ----------------------------------------- */
+
+.app.modern .hero {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 22px;
+  margin-bottom: 16px;
+  border: 1.5px dashed var(--line-strong);
+  border-radius: 16px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--brand-cyan) 8%, transparent),
+      color-mix(in srgb, var(--brand-pink) 5%, transparent)
+    ),
+    var(--bg-raised);
+}
+
+.app.modern .hero.ready {
+  border-style: solid;
+  border-color: var(--brand-cyan);
+}
+
+.app.modern .hero-title {
+  font-family: var(--display);
+  font-size: 16px;
+  letter-spacing: 0.02em;
+}
+
+.app.modern .hero-sub {
+  margin-top: 2px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+/* --- in progress, on the main screen ------------------------------------- */
+
+.app.modern .in-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  width: 100%;
+  margin-bottom: 18px;
+  padding: 13px 15px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--bg-raised);
+}
+
+.app.modern .in-progress:hover {
+  border-color: var(--line-strong);
+}
+
+.app.modern .in-progress-title,
+.app.modern .mini-more {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.app.modern .mini {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto;
+  align-items: center;
+  gap: 12px;
+  font-size: 12.5px;
+}
+
+.app.modern .mini-who {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app.modern .mini-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-sunken);
+  overflow: hidden;
+}
+
+.app.modern .mini-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--brand-cyan), #7fd0df);
+  transition: width 0.3s linear;
+}
+
+.app.modern .mini-num {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- devices ------------------------------------------------------------- */
+
+.app.modern .grid {
+  grid-template-columns: repeat(auto-fill, minmax(212px, 1fr));
+  gap: 14px;
+}
+
+.app.modern .peer {
+  /* A button centres its content vertically, so tiles with fewer chips had
+     their avatar lower than their neighbours'. */
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  padding: 18px;
+  border-radius: 16px;
+  transition: border-color 0.12s, transform 0.12s, box-shadow 0.12s, background 0.12s;
+}
+
+.app.modern .peer:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow);
+}
+
+.app.modern .peer .avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  font-size: 16px;
+}
+
+/* --- lists, transfers, buttons ------------------------------------------- */
+
+.app.modern .row,
+.app.modern .transfer {
+  border-radius: 14px;
+}
+
+.app.modern .transfer {
+  padding: 16px 18px;
+  margin-bottom: 12px;
+}
+
+.app.modern .bar {
+  height: 10px;
+}
+
+.app.modern .stats {
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.app.modern .btn {
+  border-radius: 9px;
+}
+
+.app.modern .btn.primary {
+  background: linear-gradient(135deg, var(--brand-cyan), #7fd0df);
+  border-color: transparent;
+}
+
+.app.modern .section-title {
+  font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app.modern .peer:hover {
+    transform: none;
+  }
+
+  .app.modern .mini-bar > span {
+    transition: none;
+  }
 }

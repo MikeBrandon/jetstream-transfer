@@ -57,13 +57,16 @@ impl Platform {
 
 /// Optional features a peer supports.
 ///
-/// Adding a field here is backwards compatible in one direction only: postcard
-/// is a non-self-describing format, so new fields must be appended and older
-/// peers will simply stop reading early. Never reorder or remove a field
-/// without bumping [`PROTOCOL_VERSION`].
+/// Encoded as a run of booleans at the end of [`Hello`], and decoded one at a
+/// time until the bytes run out — see [`Hello::decode`]. That makes adding a
+/// capability compatible in both directions: an older peer stops reading before
+/// the new flags, and a newer one reads an older peer's missing flags as
+/// unsupported. Append only; never reorder or remove a field without bumping
+/// [`PROTOCOL_VERSION`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Capabilities {
-    /// Peer can decompress zstd-framed chunks.
+    /// Peer can read chunk frames that may be zstd-compressed — the
+    /// [`ChunkHeaderV2`] layout.
     pub zstd: bool,
     /// Peer understands bundled small-file chunks.
     pub bundling: bool,
@@ -75,28 +78,21 @@ pub struct Capabilities {
     /// decode it and drops the transfer. So both are only ever sent to a peer
     /// that said it understands them.
     pub live_status: bool,
+    /// Peer answers [`DataRequest::ChunkHashes`], so a receiver holding an older
+    /// copy of a file can reuse the chunks that have not changed.
+    pub chunk_hashes: bool,
 }
 
-/// [`Capabilities`] as builds before `live_status` encoded them.
-///
-/// A newer peer reading an older `Hello` runs out of bytes before the new field,
-/// which postcard reports as an error rather than a default. Decoding falls back
-/// to this shape so the two builds can still talk — the older one simply gets
-/// none of the newer messages.
-#[derive(Deserialize)]
-struct LegacyCapabilities {
-    zstd: bool,
-    bundling: bool,
-}
-
-#[derive(Deserialize)]
-struct LegacyHello {
-    version: u16,
-    device_id: DeviceId,
-    name: String,
-    platform: Platform,
-    app_version: String,
-    capabilities: LegacyCapabilities,
+impl Capabilities {
+    /// Everything this build supports.
+    pub const fn ours() -> Self {
+        Self {
+            zstd: true,
+            bundling: false,
+            live_status: true,
+            chunk_hashes: true,
+        }
+    }
 }
 
 /// First message on the control stream, sent by both sides.
@@ -125,39 +121,51 @@ impl Hello {
             name: name.into(),
             platform: Platform::current(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            capabilities: Capabilities {
-                zstd: false,
-                bundling: false,
-                live_status: true,
-            },
+            capabilities: Capabilities::ours(),
         }
     }
 
-    /// Decode a `Hello` from any build, current or older.
+    /// Decode a `Hello` from any build, older or newer.
     ///
-    /// The current layout is tried first. An older peer's `Hello` is shorter by
-    /// the capabilities it predates, so it is decoded as such and the missing
-    /// capabilities read as unsupported. Extra trailing bytes from a *newer* peer
-    /// are already ignored by postcard, which is what keeps this working in the
-    /// other direction too.
+    /// Field by field, then the capability flags one at a time for as long as
+    /// there are bytes. An older peer sends fewer flags, which read as
+    /// unsupported; a newer one sends more, which are left unread. Decoding the
+    /// whole struct in one go failed outright on any difference in length.
     pub fn decode(body: &[u8]) -> Result<Self> {
-        if let Ok(hello) = postcard::from_bytes::<Self>(body) {
-            return Ok(hello);
+        fn take<'a, T: Deserialize<'a>>(rest: &mut &'a [u8]) -> Result<T> {
+            let (value, remainder) = postcard::take_from_bytes(rest)
+                .map_err(|e| Error::Protocol(format!("malformed hello: {e}")))?;
+            *rest = remainder;
+            Ok(value)
         }
 
-        let legacy: LegacyHello = postcard::from_bytes(body)
-            .map_err(|e| Error::Protocol(format!("malformed hello: {e}")))?;
+        let mut rest = body;
+        let version = take(&mut rest)?;
+        let device_id = take(&mut rest)?;
+        let name = take(&mut rest)?;
+        let platform = take(&mut rest)?;
+        let app_version = take(&mut rest)?;
+
+        let mut flags = [false; 4];
+        for flag in &mut flags {
+            if rest.is_empty() {
+                break;
+            }
+            *flag = take(&mut rest)?;
+        }
+        let [zstd, bundling, live_status, chunk_hashes] = flags;
 
         Ok(Self {
-            version: legacy.version,
-            device_id: legacy.device_id,
-            name: legacy.name,
-            platform: legacy.platform,
-            app_version: legacy.app_version,
+            version,
+            device_id,
+            name,
+            platform,
+            app_version,
             capabilities: Capabilities {
-                zstd: legacy.capabilities.zstd,
-                bundling: legacy.capabilities.bundling,
-                live_status: false,
+                zstd,
+                bundling,
+                live_status,
+                chunk_hashes,
             },
         })
     }
@@ -279,6 +287,16 @@ pub enum DataRequest {
     /// Send the BLAKE3 of this entry's complete contents, for the final
     /// post-reassembly check.
     FileHash { entry: u32 },
+    /// Send the BLAKE3 of each chunk in the range, 32 bytes apiece, in order.
+    ///
+    /// For a receiver that already holds an older copy of the file: any chunk
+    /// whose hash matches what it has locally can be copied from disk instead of
+    /// crossing the network. Only sent to a peer with
+    /// [`Capabilities::chunk_hashes`].
+    ChunkHashes {
+        entry: u32,
+        range: crate::chunk::ChunkRange,
+    },
 }
 
 /// Fixed header preceding each chunk payload on a data stream.
@@ -310,6 +328,47 @@ impl ChunkHeader {
             len: u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
             hash: bytes[8..40].try_into().expect("32 bytes"),
         }
+    }
+}
+
+/// Chunk header for peers that read compressed frames ([`Capabilities::zstd`]).
+///
+/// One field more than [`ChunkHeader`]: how many bytes follow on the wire.
+/// Fewer than `len` means the payload is zstd-compressed; exactly `len` means it
+/// is raw. A sender only compresses when the result is strictly smaller, so the
+/// two can never be confused. The hash is always of the *uncompressed* chunk, so
+/// verification is identical either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkHeaderV2 {
+    pub index: u32,
+    pub len: u32,
+    pub wire_len: u32,
+    pub hash: [u8; 32],
+}
+
+impl ChunkHeaderV2 {
+    pub const SIZE: usize = 4 + 4 + 4 + 32;
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[0..4].copy_from_slice(&self.index.to_le_bytes());
+        out[4..8].copy_from_slice(&self.len.to_le_bytes());
+        out[8..12].copy_from_slice(&self.wire_len.to_le_bytes());
+        out[12..44].copy_from_slice(&self.hash);
+        out
+    }
+
+    pub fn decode(bytes: &[u8; Self::SIZE]) -> Self {
+        Self {
+            index: u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")),
+            len: u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
+            wire_len: u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")),
+            hash: bytes[12..44].try_into().expect("32 bytes"),
+        }
+    }
+
+    pub fn compressed(&self) -> bool {
+        self.wire_len < self.len
     }
 }
 
@@ -460,41 +519,68 @@ mod tests {
         assert!(read_frame::<_, Hello>(&mut buf.as_slice(), MAX_CONTROL_FRAME).await.is_err());
     }
 
-    /// A `Hello` exactly as builds before `live_status` wrote it.
+    /// A `Hello` as a build with `flags` capabilities wrote it.
     #[derive(Serialize)]
-    struct OldHello {
+    struct OtherHello<F: Serialize> {
         version: u16,
         device_id: DeviceId,
         name: String,
         platform: Platform,
         app_version: String,
-        capabilities: (bool, bool),
+        capabilities: F,
+    }
+
+    fn other_hello<F: Serialize>(flags: F) -> Vec<u8> {
+        postcard::to_stdvec(&OtherHello {
+            version: PROTOCOL_VERSION,
+            device_id: DeviceId::from_bytes([3u8; DEVICE_ID_LEN]),
+            name: "Other Build".into(),
+            platform: Platform::Windows,
+            app_version: "0.1.0".into(),
+            capabilities: flags,
+        })
+        .unwrap()
     }
 
     #[test]
     fn an_older_peers_hello_still_decodes_without_the_new_capability() {
-        let old = OldHello {
-            version: PROTOCOL_VERSION,
-            device_id: DeviceId::from_bytes([3u8; DEVICE_ID_LEN]),
-            name: "Old Build".into(),
-            platform: Platform::Windows,
-            app_version: "0.1.0".into(),
-            capabilities: (false, false),
-        };
-        let body = postcard::to_stdvec(&old).unwrap();
-
-        let decoded = Hello::decode(&body).unwrap();
-        assert_eq!(decoded.name, "Old Build");
+        // The first release: two flags.
+        let decoded = Hello::decode(&other_hello((false, false))).unwrap();
+        assert_eq!(decoded.name, "Other Build");
         assert!(
-            !decoded.capabilities.live_status,
+            !decoded.capabilities.live_status && !decoded.capabilities.chunk_hashes,
             "an older build must never be sent messages it cannot decode"
         );
+
+        // The release that added `live_status`: three flags.
+        let decoded = Hello::decode(&other_hello((false, false, true))).unwrap();
+        assert!(decoded.capabilities.live_status);
+        assert!(!decoded.capabilities.chunk_hashes);
+    }
+
+    #[test]
+    fn a_newer_peers_extra_capabilities_are_ignored() {
+        let decoded = Hello::decode(&other_hello((true, false, true, true, true, true))).unwrap();
+        assert!(decoded.capabilities.zstd && decoded.capabilities.chunk_hashes);
     }
 
     #[test]
     fn a_newer_hello_decodes_with_its_capabilities() {
         let body = postcard::to_stdvec(&test_hello()).unwrap();
-        assert!(Hello::decode(&body).unwrap().capabilities.live_status);
+        assert_eq!(Hello::decode(&body).unwrap().capabilities, Capabilities::ours());
+    }
+
+    #[test]
+    fn compressed_chunk_headers_round_trip() {
+        let header = ChunkHeaderV2 {
+            index: 7,
+            len: 1 << 20,
+            wire_len: 300_000,
+            hash: [0xCD; 32],
+        };
+        assert_eq!(ChunkHeaderV2::decode(&header.encode()), header);
+        assert!(header.compressed());
+        assert!(!ChunkHeaderV2 { wire_len: 1 << 20, ..header }.compressed());
     }
 
     #[test]

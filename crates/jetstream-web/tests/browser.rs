@@ -671,3 +671,22 @@ async fn the_server_stops_listening_when_asked() {
         "the port should be closed after stopping"
     );
 }
+
+/// A phone adding the page to its home screen fetches these without the
+/// session cookie, so they must be served without one — and must say nothing.
+#[tokio::test]
+async fn the_home_screen_manifest_and_icon_need_no_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(TestApp::new(dir.path().to_path_buf(), true)).await;
+    let mut client = Client::new(server.address());
+
+    let manifest = client.get("/manifest.webmanifest").await;
+    assert_eq!(manifest.status, 200);
+    assert_eq!(manifest.json()["name"], "Jetstream");
+
+    let icon = client.get("/icon.png").await;
+    assert_eq!(icon.status, 200);
+    assert!(icon.body.starts_with(b"\x89PNG"));
+
+    server.stop().await;
+}

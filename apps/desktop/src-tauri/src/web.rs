@@ -53,10 +53,10 @@ impl WebHandler for DesktopWebHandler {
         let state = Arc::clone(&self.state);
 
         Box::pin(async move {
-            let (destination, conflict) = {
-                let settings = state.settings.lock().expect("settings poisoned");
-                (settings.download_dir.clone(), settings.on_conflict)
-            };
+            let conflict = state.settings.lock().expect("settings poisoned").on_conflict;
+            // A browser has no device id, so no folder of its own — but with a
+            // folder per device, phones get one named after what they are.
+            let destination = crate::commands::destination_for(&state, "", &guest.label);
 
             let id = state.next_id();
             let progress = Arc::new(Progress::default());

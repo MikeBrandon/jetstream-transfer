@@ -59,6 +59,10 @@ export interface TrustedView {
   firstPaired: number;
   lastSeen: number;
   online: boolean;
+  /** This device's own download folder, if one was chosen. */
+  downloadDir: string | null;
+  /** Whether it can be woken with Wake-on-LAN. */
+  canWake: boolean;
 }
 
 export interface TransferView {
@@ -87,6 +91,10 @@ export interface TransferView {
   detail: string | null;
   startedAt: number;
   resumable: boolean;
+  /** Speed over the last minute, one reading a second, oldest first. */
+  rateHistory: number[];
+  /** Bytes copied from an older copy at the destination instead of sent. */
+  reused: number;
 }
 
 export interface OfferView {
@@ -165,8 +173,28 @@ export interface HistoryView {
   detail: string | null;
   /** How much had arrived when it last stopped. */
   transferred: number;
+  /** Seconds the last attempt spent moving data. */
+  seconds: number;
+  /** Average speed over those seconds, bytes per second. */
+  averageRate: number;
   canRetry: boolean;
 }
+
+/** A folder kept sent to a device as it changes. */
+export interface WatchedFolderView {
+  id: number;
+  folder: string;
+  deviceId: string;
+  deviceName: string;
+  enabled: boolean;
+  lastSynced: number;
+  problem: string | null;
+  sending: boolean;
+  waiting: number;
+  filesSent: number;
+}
+
+export type Interface = "classic" | "modern";
 
 /** Text pasted on a phone or other browser and sent to this machine. */
 export interface WebText {
@@ -181,6 +209,12 @@ export interface SettingsView {
   /** Kilobytes per second; 0 means no limit. */
   sendLimitKbps: number;
   receiveLimitKbps: number;
+  /** When to compress and reuse older copies. `auto`: VPN and internet only. */
+  bandwidthSaving: "auto" | "always" | "never";
+  /** Put each device's files in a folder named after it. */
+  folderPerDevice: boolean;
+  /** Which interface to show. Classic stays the default. */
+  interface: Interface;
 }
 
 export const api = {
@@ -199,6 +233,17 @@ export const api = {
   addDeviceByAddress: (address: string) =>
     invoke<PeerView>("add_device_by_address", { address }),
   listManualDevices: () => invoke<ManualDevice[]>("list_manual_devices"),
+  setDeviceFolder: (deviceId: string, folder: string | null) =>
+    invoke<void>("set_device_folder", { deviceId, folder }),
+  wakeDevice: (deviceId: string) => invoke<void>("wake_device", { deviceId }),
+
+  listWatchedFolders: () => invoke<WatchedFolderView[]>("list_watched_folders"),
+  addWatchedFolder: (folder: string, deviceId: string, sendExisting: boolean) =>
+    invoke<void>("add_watched_folder", { folder, deviceId, sendExisting }),
+  removeWatchedFolder: (id: number) => invoke<void>("remove_watched_folder", { id }),
+  setWatchedFolderEnabled: (id: number, enabled: boolean) =>
+    invoke<void>("set_watched_folder_enabled", { id, enabled }),
+  syncFolderNow: () => invoke<void>("sync_folder_now"),
   forgetManualDevice: (deviceId: string) =>
     invoke<void>("forget_manual_device", { deviceId }),
   cancelTransfer: (id: number) => invoke<void>("cancel_transfer", { id }),
@@ -266,6 +311,9 @@ export const events = {
   /** Text sent from a browser. */
   webText: (fn: (text: WebText) => void): Promise<UnlistenFn> =>
     listen<WebText>("web-text", (e) => fn(e.payload)),
+  /** A watched folder was looked at, or finished sending. */
+  foldersChanged: (fn: () => void): Promise<UnlistenFn> =>
+    listen("folders-changed", () => fn()),
 };
 
 /** States in which a transfer is still going. Everything else has stopped. */
@@ -315,6 +363,14 @@ export function formatEta(seconds: number | null): string {
   return `${(seconds / 3600).toFixed(1)}h left`;
 }
 
+/** A length of time as a person says it: "45s", "3m 20s", "1h 12m". */
+export function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
 export function formatWhen(unixSeconds: number): string {
   if (!unixSeconds) return "never";
   const ago = Date.now() / 1000 - unixSeconds;
@@ -322,7 +378,10 @@ export function formatWhen(unixSeconds: number): string {
   if (ago < 60) return "just now";
   if (ago < 3600) return `${Math.round(ago / 60)} min ago`;
   if (ago < 86400) return `${Math.round(ago / 3600)} hr ago`;
-  if (ago < 2592000) return `${Math.round(ago / 86400)} days ago`;
+  if (ago < 2592000) {
+    const days = Math.round(ago / 86400);
+    return days === 1 ? "yesterday" : `${days} days ago`;
+  }
   return new Date(unixSeconds * 1000).toLocaleDateString();
 }
 

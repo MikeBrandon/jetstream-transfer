@@ -6,13 +6,33 @@
  * does not know that will retry by hand, or worse, assume the transfer is lost.
  */
 
-import { formatBytes, formatWhen, type HistoryView } from "../api";
+import {
+  formatBytes,
+  formatDuration,
+  formatRate,
+  formatWhen,
+  type HistoryView,
+} from "../api";
 
 interface Props {
   records: HistoryView[];
   onRetry: (record: HistoryView) => void;
   onForget: (record: HistoryView) => void;
   onClear: () => void;
+  /** The modern interface groups the list by day. */
+  modern?: boolean;
+}
+
+/** "Today", "Yesterday", or the date — the heading a record is filed under. */
+function dayOf(unixSeconds: number): string {
+  const day = new Date(unixSeconds * 1000);
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+
+  if (day.toDateString() === today.toDateString()) return "Today";
+  if (day.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return day.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
 }
 
 // Every outcome the Rust side can send must have a case. A missing one returned
@@ -45,7 +65,7 @@ function retryLabel(record: HistoryView): string {
   return "Retry";
 }
 
-export function History({ records, onRetry, onForget, onClear }: Props) {
+export function History({ records, onRetry, onForget, onClear, modern = false }: Props) {
   if (records.length === 0) {
     return (
       <div className="empty">
@@ -73,11 +93,15 @@ export function History({ records, onRetry, onForget, onClear }: Props) {
         </p>
       )}
 
-      {records.map((record) => {
+      {records.map((record, index) => {
         const chip = outcomeChip(record);
+        const day = dayOf(record.at);
+        const heading = modern && (index === 0 || dayOf(records[index - 1]!.at) !== day);
 
         return (
-          <div className="row" key={record.id}>
+          <div key={record.id}>
+          {heading && <div className="day-heading">{day}</div>}
+          <div className="row">
             <span
               aria-hidden="true"
               style={{
@@ -106,6 +130,10 @@ export function History({ records, onRetry, onForget, onClear }: Props) {
               <div style={{ fontSize: 11, color: "var(--text-faint)" }}>
                 {formatWhen(record.at)}
                 {record.attempts > 0 && ` · ${record.attempts} attempt${record.attempts === 1 ? "" : "s"}`}
+                {/* How long it took and how fast, so a slow transfer can be told
+                    from a big one. Measured over the time data was moving. */}
+                {record.seconds > 0 && ` · ${formatDuration(record.seconds)}`}
+                {record.averageRate > 0 && ` · average ${formatRate(record.averageRate)}`}
               </div>
               {record.detail && (
                 <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginTop: 2 }}>
@@ -122,6 +150,7 @@ export function History({ records, onRetry, onForget, onClear }: Props) {
             <button className="btn ghost small" onClick={() => onForget(record)}>
               Remove
             </button>
+          </div>
           </div>
         );
       })}

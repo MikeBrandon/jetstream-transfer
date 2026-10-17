@@ -30,7 +30,9 @@ use crate::chunk::{self, CHUNK_SIZE, ChunkRange};
 use crate::error::{Error, Result};
 use crate::manifest::{ENTRIES_PER_BATCH, Manifest, Summary};
 use crate::path::to_extended_length;
-use crate::proto::{self, ChunkHeader, Control, DataRequest, MAX_CONTROL_FRAME, Offer, StopReason};
+use crate::proto::{
+    self, ChunkHeader, ChunkHeaderV2, Control, DataRequest, MAX_CONTROL_FRAME, Offer, StopReason,
+};
 use crate::staging::{ConflictPolicy, Placement, Staging};
 use crate::transport::Session;
 
@@ -50,6 +52,9 @@ pub struct Progress {
     /// as tens of gigabytes a second. Rates come from this counter instead, which
     /// only ever grows by bytes that moved.
     pub bytes_moved: AtomicU64,
+    /// Bytes copied from an older copy of a file already at the destination,
+    /// rather than sent. Counted in `bytes_done`, never in `bytes_moved`.
+    pub bytes_reused: AtomicU64,
     /// Set to ask the transfer to stop at the next chunk boundary. Staged data
     /// is kept, so a cancelled transfer can be resumed rather than restarted.
     pub cancel: AtomicBool,
@@ -211,6 +216,65 @@ fn stopped_by_peer(reason: StopReason) -> Error {
     }
 }
 
+/// When to spend CPU to save network: compressing chunks on the way out, and
+/// reusing unchanged chunks of a file the receiver already has an older copy of.
+///
+/// Both cost CPU and disk on each side and both save bytes on the wire, which is
+/// a good trade on a VPN or the internet and usually a bad one on a gigabit LAN,
+/// where the network is rarely the slow part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Saving {
+    /// Only when the other device is not on the local network.
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl Saving {
+    pub fn applies(self, peer: std::net::SocketAddr) -> bool {
+        match self {
+            Self::Auto => !crate::transport::quic::is_lan(peer),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
+/// Choices that shape a transfer without changing what it moves.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    pub saving: Saving,
+}
+
+/// zstd level for chunks. Low: on a link slow enough to want compression the
+/// CPU is rarely the bottleneck, but there is no reason to make it one.
+const ZSTD_LEVEL: i32 = 3;
+
+/// A chunk is sent compressed only if that saves at least this fraction.
+/// Anything less is not worth the receiver's time to undo.
+const MIN_SAVING_PERCENT: usize = 5;
+
+/// Give up compressing a range after this many chunks in a row that did not
+/// shrink — the file is not compressible, whatever its name says.
+const COMPRESSION_MISSES: u32 = 3;
+
+/// Whether a file is worth trying to compress, judged by its extension.
+///
+/// Already-compressed formats would only cost CPU on both sides for nothing.
+/// Anything not listed is tried, and given up on quickly if it does not shrink.
+fn worth_compressing(path: &Path) -> bool {
+    const PACKED: &[&str] = &[
+        "7z", "aac", "apk", "avi", "avif", "br", "bz2", "cab", "deb", "docx", "epub", "flac",
+        "gif", "gz", "heic", "heif", "jar", "jpeg", "jpg", "jxl", "m4a", "m4v", "mkv", "mov",
+        "mp3", "mp4", "msi", "ogg", "opus", "png", "pptx", "rar", "rpm", "tgz", "webm", "webp",
+        "wmv", "xlsx", "xz", "zip", "zst",
+    ];
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_none_or(|ext| !PACKED.iter().any(|packed| ext.eq_ignore_ascii_case(packed)))
+}
+
 /// What the receiving side decided about an offer.
 pub enum Decision {
     Accept {
@@ -242,6 +306,17 @@ pub async fn send(
     root: &Path,
     manifest: &Manifest,
     progress: Arc<Progress>,
+) -> Result<()> {
+    send_with(session, root, manifest, progress, Options::default()).await
+}
+
+/// [`send`], with [`Options`].
+pub async fn send_with(
+    session: &Session,
+    root: &Path,
+    manifest: &Manifest,
+    progress: Arc<Progress>,
+    options: Options,
 ) -> Result<()> {
     manifest.validate()?;
 
@@ -303,7 +378,24 @@ pub async fn send(
             .await?;
     }
 
-    serve_requests(session, root, manifest, progress).await
+    // Compressed frames only to a peer that can read them, and compression
+    // itself only where it pays — see `Saving`.
+    let framing = Framing {
+        v2: session.peer().capabilities.zstd,
+        compress: session.peer().capabilities.zstd
+            && options.saving.applies(session.peer().remote_address),
+    };
+
+    serve_requests(session, root, manifest, progress, framing).await
+}
+
+/// How chunk frames are written to this peer.
+#[derive(Debug, Clone, Copy)]
+struct Framing {
+    /// Use [`ChunkHeaderV2`], which can carry compressed data.
+    v2: bool,
+    /// Try compressing chunks. Only ever true with `v2`.
+    compress: bool,
 }
 
 /// Answer data-stream requests until the receiver says it is done.
@@ -316,6 +408,7 @@ async fn serve_requests(
     root: &Path,
     manifest: &Manifest,
     progress: Arc<Progress>,
+    framing: Framing,
 ) -> Result<()> {
     // Shared between the three futures below: when the receiver was last heard
     // from, in milliseconds since this call began.
@@ -419,7 +512,7 @@ async fn serve_requests(
             // One task per request, so a slow disk read on one file does not
             // hold up the others.
             tokio::spawn(async move {
-                if let Err(e) = answer(send, recv, &root, &manifest, progress, live).await {
+                if let Err(e) = answer(send, recv, &root, &manifest, progress, live, framing).await {
                     tracing::debug!(error = %e, "data request failed");
                 }
             });
@@ -478,6 +571,7 @@ async fn answer(
     manifest: &Manifest,
     progress: Arc<Progress>,
     live: bool,
+    framing: Framing,
 ) -> Result<()> {
     let request: DataRequest = proto::read_frame(&mut recv, MAX_CONTROL_FRAME).await?;
 
@@ -493,10 +587,11 @@ async fn answer(
             //    sequentially, instead of open-seek-read per chunk;
             //  * disk reads and BLAKE3 overlap with the socket writes, rather
             //    than taking turns, which is what the serial version did.
-            let mut chunks = read_range(source, size, range);
+            let compress = framing.compress && worth_compressing(&source);
+            let mut chunks = read_range(source, size, range, compress);
 
             while let Some(prepared) = chunks.recv().await {
-                let (header, data) = prepared?;
+                let (header, payload) = prepared?;
 
                 // Stop serving the moment the user pauses or cancels, rather than
                 // finishing ranges nobody is going to wait for.
@@ -504,16 +599,34 @@ async fn answer(
 
                 // An upload cap. Independent of the receiver's own limit — either
                 // side may want to protect its link, and neither has to know
-                // about the other's choice. Whichever is lower simply wins.
-                progress.limit.take(data.len() as u64).await;
+                // about the other's choice. Whichever is lower simply wins. What
+                // crosses the wire is what counts, compressed or not.
+                progress.limit.take(payload.len() as u64).await;
 
-                send.write_all(&header.encode()).await?;
-                send.write_all(&data).await?;
+                if framing.v2 {
+                    let framed = ChunkHeaderV2 {
+                        index: header.index,
+                        len: header.len,
+                        wire_len: payload.len() as u32,
+                        hash: header.hash,
+                    };
+                    send.write_all(&framed.encode()).await?;
+                } else {
+                    send.write_all(&header.encode()).await?;
+                }
+                send.write_all(&payload).await?;
 
                 // Bytes handed to QUIC, not bytes delivered — see `live`.
                 if !live {
-                    progress.advance(data.len() as u64);
+                    progress.advance(u64::from(header.len));
                 }
+            }
+        }
+        DataRequest::ChunkHashes { entry, range } => {
+            let source = resolve_source(manifest, root, entry)?;
+            let size = manifest.entries[entry as usize].size();
+            for hash in hash_chunks(source, size, range).await? {
+                send.write_all(&hash).await?;
             }
         }
         DataRequest::FileHash { entry } => {
@@ -548,10 +661,15 @@ fn resolve_source(manifest: &Manifest, root: &Path, entry: u32) -> Result<PathBu
 /// Returns a channel so the caller can write to the socket while the next chunk
 /// is being read and hashed. The bounded depth keeps at most a few megabytes in
 /// flight and applies backpressure when the network is the slower side.
+///
+/// The second item is what goes on the wire: the chunk itself, or — when
+/// `compress` is set and it shrinks enough — the chunk zstd-compressed. The
+/// header always describes the uncompressed chunk.
 fn read_range(
     path: PathBuf,
     size: u64,
     range: ChunkRange,
+    compress: bool,
 ) -> tokio::sync::mpsc::Receiver<Result<(ChunkHeader, Vec<u8>)>> {
     // Three deep: enough to keep the socket fed across a disk hiccup, small
     // enough that eight concurrent requests do not hold 100 MB of buffers.
@@ -567,6 +685,9 @@ fn read_range(
             let (start, _) = chunk::chunk_span(range.start, size)?;
             file.seek(SeekFrom::Start(start))?;
 
+            let mut trying = compress;
+            let mut misses = 0;
+
             for index in range.iter() {
                 let (_, len) = chunk::chunk_span(index, size)?;
 
@@ -579,9 +700,25 @@ fn read_range(
                     hash: *blake3::hash(&data).as_bytes(),
                 };
 
+                let mut payload = data;
+                if trying {
+                    match zstd::bulk::compress(&payload, ZSTD_LEVEL) {
+                        Ok(packed)
+                            if packed.len() < payload.len() - payload.len() * MIN_SAVING_PERCENT / 100 =>
+                        {
+                            payload = packed;
+                            misses = 0;
+                        }
+                        _ => {
+                            misses += 1;
+                            trying = misses < COMPRESSION_MISSES;
+                        }
+                    }
+                }
+
                 // A closed channel means the peer went away mid-request; stop
                 // reading rather than finish work nobody will collect.
-                if tx.blocking_send(Ok((header, data))).is_err() {
+                if tx.blocking_send(Ok((header, payload))).is_err() {
                     return Ok(());
                 }
             }
@@ -594,6 +731,30 @@ fn read_range(
     });
 
     rx
+}
+
+/// The BLAKE3 of each chunk in a range, for [`DataRequest::ChunkHashes`].
+async fn hash_chunks(path: PathBuf, size: u64, range: ChunkRange) -> Result<Vec<[u8; 32]>> {
+    let path = to_extended_length(&path);
+
+    tokio::task::spawn_blocking(move || -> Result<Vec<[u8; 32]>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = std::fs::File::open(&path)?;
+        let (start, _) = chunk::chunk_span(range.start, size)?;
+        file.seek(SeekFrom::Start(start))?;
+
+        let mut hashes = Vec::with_capacity(range.len() as usize);
+        let mut buffer = vec![0u8; CHUNK_SIZE as usize];
+        for index in range.iter() {
+            let (_, len) = chunk::chunk_span(index, size)?;
+            file.read_exact(&mut buffer[..len])?;
+            hashes.push(*blake3::hash(&buffer[..len]).as_bytes());
+        }
+        Ok(hashes)
+    })
+    .await
+    .map_err(|e| Error::Io(std::io::Error::other(e)))?
 }
 
 async fn hash_file(path: &Path) -> Result<[u8; 32]> {
@@ -635,6 +796,19 @@ async fn hash_file(path: &Path) -> Result<[u8; 32]> {
 /// The offer is passed by value so the callback can hold it across an await
 /// without borrowing from the engine's stack.
 pub async fn receive<F>(session: &Session, decide: F, progress: Arc<Progress>) -> Result<Received>
+where
+    F: AsyncFnOnce(Offer) -> Decision,
+{
+    receive_with(session, decide, progress, Options::default()).await
+}
+
+/// [`receive`], with [`Options`].
+pub async fn receive_with<F>(
+    session: &Session,
+    decide: F,
+    progress: Arc<Progress>,
+    options: Options,
+) -> Result<Received>
 where
     F: AsyncFnOnce(Offer) -> Decision,
 {
@@ -687,7 +861,18 @@ where
     }
 
     std::fs::create_dir_all(to_extended_length(&destination))?;
-    let staging = Staging::open(&destination, manifest, conflict)?;
+    let mut staging = Staging::open(&destination, manifest, conflict)?;
+
+    // An older copy of a file already at the destination can stand in for
+    // every chunk that has not changed — on a slow link, the difference between
+    // re-sending a 20 GB disk image and sending the few megabytes that differ.
+    // Skip never needs it: it leaves existing files alone entirely.
+    if conflict != ConflictPolicy::Skip
+        && session.peer().capabilities.chunk_hashes
+        && options.saving.applies(session.peer().remote_address)
+    {
+        staging = reuse_older_copies(session, staging, &destination, &progress).await?;
+    }
 
     progress
         .bytes_total
@@ -1248,7 +1433,8 @@ async fn pull_range(
     proto::write_frame(&mut send, &DataRequest::Chunks { entry, range }).await?;
     send.finish().map_err(Error::transport)?;
 
-    let mut header_bytes = [0u8; ChunkHeader::SIZE];
+    // A sender that can compress frames always uses the frame that can say so.
+    let v2 = session.peer().capabilities.zstd;
 
     for expected_index in range.iter() {
         progress.check_interrupted()?;
@@ -1260,18 +1446,22 @@ async fn pull_range(
         // at full speed regardless.
         progress.limit.take(CHUNK_SIZE).await;
 
-        recv.read_exact(&mut header_bytes)
-            .await
-            .map_err(|e| Error::Transport(format!("chunk header: {e}")))?;
-        let header = ChunkHeader::decode(&header_bytes);
+        let header = read_chunk_header(&mut recv, v2).await?;
 
-        // Bound the length before allocating, so a hostile peer cannot make us
-        // reserve or read an arbitrary amount.
+        // Bound the lengths before allocating, so a hostile peer cannot make us
+        // reserve or read an arbitrary amount — and cannot use compression to
+        // make a small frame expand into a large one.
         if header.len as u64 > CHUNK_SIZE {
             return Err(Error::FrameTooLarge {
                 size: header.len as usize,
                 limit: CHUNK_SIZE as usize,
             });
+        }
+        if header.wire_len > header.len {
+            return Err(Error::Protocol(format!(
+                "chunk {} claims {} bytes on the wire for {} bytes of data",
+                header.index, header.wire_len, header.len
+            )));
         }
         if header.index != expected_index {
             return Err(Error::Protocol(format!(
@@ -1285,19 +1475,24 @@ async fn pull_range(
         // finished in near-lockstep: on a slow link nothing was counted for a
         // second or more and then eight megabytes at once, and the speed shown
         // flipped between zero and double.
-        let mut data = vec![0u8; header.len as usize];
+        //
+        // Progress counts file bytes, not wire bytes, so a compressed chunk is
+        // credited in proportion as it arrives and adds up to its full length.
+        let (len, wire_len) = (u64::from(header.len), u64::from(header.wire_len).max(1));
+        let credit = |filled: usize| filled as u64 * len / wire_len;
+        let mut wire = vec![0u8; header.wire_len as usize];
         let mut filled = 0;
-        while filled < data.len() {
-            match recv.read(&mut data[filled..]).await {
+        while filled < wire.len() {
+            match recv.read(&mut wire[filled..]).await {
                 Ok(Some(read)) => {
+                    progress.advance(credit(filled + read) - credit(filled));
                     filled += read;
-                    progress.advance(read as u64);
                 }
                 Ok(None) => {
                     return Err(Error::Transport(format!(
                         "chunk {}: the stream ended {} bytes early",
                         header.index,
-                        data.len() - filled
+                        wire.len() - filled
                     )));
                 }
                 Err(e) => {
@@ -1305,6 +1500,25 @@ async fn pull_range(
                 }
             }
         }
+
+        let data = if header.compressed() {
+            // Bounded by the declared length: anything that would expand past
+            // it is refused rather than allocated.
+            let data = zstd::bulk::decompress(&wire, header.len as usize).map_err(|e| {
+                Error::Protocol(format!("chunk {} would not decompress: {e}", header.index))
+            })?;
+            if data.len() != header.len as usize {
+                return Err(Error::Protocol(format!(
+                    "chunk {} decompressed to {} bytes, not {}",
+                    header.index,
+                    data.len(),
+                    header.len
+                )));
+            }
+            data
+        } else {
+            wire
+        };
 
         // The channel is bounded, so a disk that cannot keep up applies
         // backpressure here rather than growing a queue without limit.
@@ -1320,6 +1534,193 @@ async fn pull_range(
     }
 
     Ok(())
+}
+
+/// Files at least this big are worth comparing with an older copy. Below it,
+/// sending the file costs about what asking for its hashes would.
+const REUSE_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+/// Chunk hashes asked for per request: 32 KiB of answer, and on the sender a
+/// read of up to a gigabyte, which keeps any one request from taking minutes.
+const HASHES_PER_REQUEST: u32 = 1024;
+
+/// Copy every unchanged chunk from older copies of files at the destination.
+///
+/// For each large file not yet complete, if a file already sits where it will
+/// land, ask the sender for the hashes of the missing chunks that copy could
+/// cover, then read those chunks locally and keep each one whose hash matches.
+/// Matching is chunk-for-chunk at the same offset, so it catches files changed
+/// in place or added to at the end — the common cases for disk images,
+/// archives, logs and databases — and every reused chunk is verified exactly
+/// as a received one would be, before and after assembly.
+///
+/// Best-effort throughout. Anything that goes wrong leaves those chunks to be
+/// fetched normally.
+async fn reuse_older_copies(
+    session: &Session,
+    mut staging: Staging,
+    destination: &Path,
+    progress: &Progress,
+) -> Result<Staging> {
+    let mut candidates = Vec::new();
+    for (index, entry) in staging.manifest().entries.iter().enumerate() {
+        let index = index as u32;
+        if !entry.is_file() || entry.size() < REUSE_THRESHOLD || staging.is_placed(index) {
+            continue;
+        }
+        let existing = to_extended_length(&entry.path.resolve_in(destination));
+        let Ok(metadata) = std::fs::metadata(&existing) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() == 0 {
+            continue;
+        }
+
+        // Only chunks the older copy is long enough to hold in full.
+        let size = entry.size();
+        let usable = staging
+            .chunk_map(index)
+            .map(|map| map.missing_ranges())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|range| {
+                let end = range
+                    .iter()
+                    .take_while(|&chunk| {
+                        chunk::chunk_span(chunk, size)
+                            .is_ok_and(|(offset, len)| offset + len as u64 <= metadata.len())
+                    })
+                    .last()?
+                    + 1;
+                Some(ChunkRange::new(range.start, end))
+            })
+            .collect::<Vec<_>>();
+        if !usable.is_empty() {
+            candidates.push((index, existing, size, usable));
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(staging);
+    }
+
+    // The network half: every hash, before touching the disk.
+    let mut wanted = Vec::new();
+    for (index, existing, size, ranges) in candidates {
+        for range in ranges {
+            let mut start = range.start;
+            while start < range.end {
+                let end = (start + HASHES_PER_REQUEST).min(range.end);
+                let piece = ChunkRange::new(start, end);
+                match request_chunk_hashes(session, index, piece).await {
+                    Ok(hashes) => wanted.push((index, existing.clone(), size, piece, hashes)),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "could not get chunk hashes; sending in full");
+                        break;
+                    }
+                }
+                start = end;
+            }
+        }
+    }
+
+    // The disk half, off the async runtime: it may read gigabytes.
+    let (staging, reused) = tokio::task::spawn_blocking(move || {
+        let mut reused = 0u64;
+        for (index, existing, size, range, hashes) in wanted {
+            reused += reuse_matching(&mut staging, index, &existing, size, range, &hashes);
+        }
+        (staging, reused)
+    })
+    .await
+    .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+
+    if reused > 0 {
+        tracing::info!(reused, "reused unchanged data from older copies at the destination");
+        progress.bytes_reused.fetch_add(reused, Ordering::Relaxed);
+    }
+    Ok(staging)
+}
+
+/// Stage every chunk of `existing` in `range` whose hash matches the sender's.
+/// Returns the bytes reused.
+fn reuse_matching(
+    staging: &mut Staging,
+    index: u32,
+    existing: &Path,
+    size: u64,
+    range: ChunkRange,
+    hashes: &[[u8; 32]],
+) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(existing) else {
+        return 0;
+    };
+    let mut buffer = vec![0u8; CHUNK_SIZE as usize];
+    let mut reused = 0u64;
+
+    for (chunk, hash) in range.iter().zip(hashes) {
+        let Ok((offset, len)) = chunk::chunk_span(chunk, size) else {
+            break;
+        };
+        if file.seek(SeekFrom::Start(offset)).is_err() || file.read_exact(&mut buffer[..len]).is_err() {
+            break;
+        }
+        // `write_chunk` checks the hash before writing, so a chunk that has
+        // changed is simply refused here and fetched later.
+        if let Ok(true) = staging.write_chunk(index, chunk, &buffer[..len], hash) {
+            reused += len as u64;
+        }
+    }
+
+    if reused > 0
+        && let Err(e) = staging.checkpoint(index)
+    {
+        tracing::debug!(index, error = %e, "could not record reused chunks");
+    }
+    reused
+}
+
+async fn request_chunk_hashes(
+    session: &Session,
+    entry: u32,
+    range: ChunkRange,
+) -> Result<Vec<[u8; 32]>> {
+    let (mut send, mut recv) = session.open_stream().await?;
+    proto::write_frame(&mut send, &DataRequest::ChunkHashes { entry, range }).await?;
+    send.finish().map_err(Error::transport)?;
+
+    let mut hashes = vec![[0u8; 32]; range.len() as usize];
+    for hash in &mut hashes {
+        recv.read_exact(hash)
+            .await
+            .map_err(|e| Error::Transport(format!("chunk hashes for entry {entry}: {e}")))?;
+    }
+    Ok(hashes)
+}
+
+/// Read the next chunk header in whichever layout this sender uses, as the
+/// newer one. An older header is a raw chunk: as many bytes on the wire as in
+/// the chunk.
+async fn read_chunk_header(recv: &mut quinn::RecvStream, v2: bool) -> Result<ChunkHeaderV2> {
+    let failed = |e: quinn::ReadExactError| Error::Transport(format!("chunk header: {e}"));
+
+    if v2 {
+        let mut bytes = [0u8; ChunkHeaderV2::SIZE];
+        recv.read_exact(&mut bytes).await.map_err(failed)?;
+        Ok(ChunkHeaderV2::decode(&bytes))
+    } else {
+        let mut bytes = [0u8; ChunkHeader::SIZE];
+        recv.read_exact(&mut bytes).await.map_err(failed)?;
+        let header = ChunkHeader::decode(&bytes);
+        Ok(ChunkHeaderV2 {
+            index: header.index,
+            len: header.len,
+            wire_len: header.len,
+            hash: header.hash,
+        })
+    }
 }
 
 async fn request_file_hash(session: &Session, entry: u32) -> Result<[u8; 32]> {

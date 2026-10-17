@@ -17,7 +17,10 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   api,
   events,
+  formatPercent,
+  formatRate,
   isRunning,
+  type Interface,
   type OfferView,
   type PeerView,
   type SelfView,
@@ -27,6 +30,8 @@ import {
 } from "./api";
 import type { FirewallView, HistoryView, NetworkProfileView, WebText } from "./api";
 import { AddDevice } from "./components/AddDevice";
+import { Folders } from "./components/Folders";
+import { NavIcon } from "./components/NavIcon";
 import { NetworkProfileCard } from "./components/NetworkProfileCard";
 import { History } from "./components/History";
 import { Browser } from "./components/Browser";
@@ -38,7 +43,15 @@ import { Peers } from "./components/Peers";
 import { Settings } from "./components/Settings";
 import { Transfers } from "./components/Transfers";
 
-type Tab = "devices" | "transfers" | "history" | "browser" | "trusted" | "network" | "settings";
+export type Tab =
+  | "devices"
+  | "transfers"
+  | "history"
+  | "folders"
+  | "browser"
+  | "trusted"
+  | "network"
+  | "settings";
 
 export function App() {
   const [self, setSelf] = useState<SelfView | null>(null);
@@ -53,6 +66,12 @@ export function App() {
   const [pending, setPending] = useState<string[]>([]);
   const [hovering, setHovering] = useState(false);
   const [adding, setAdding] = useState(false);
+  /** Choosing several devices for one send, and which are chosen. */
+  const [selecting, setSelecting] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  /** Classic or modern. Read from settings; classic until they say otherwise. */
+  const [ui, setUi] = useState<Interface>("classic");
+  const modern = ui === "modern";
 
   // Surfaced on the main screen, not buried in the Network tab. A blocked
   // firewall means the app can send but never receive, and a first-run user
@@ -86,6 +105,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    void api.getSettings().then((settings) => setUi(settings.interface));
     void api.getSelf().then(setSelf);
     void api.listPeers().then(setPeers);
     void api.listTransfers().then(setTransfers);
@@ -178,8 +198,19 @@ export function App() {
     [say],
   );
 
+  const selectingRef = useRef(false);
+  selectingRef.current = selecting;
+
   const pickPeer = useCallback(
     async (peer: PeerView) => {
+      if (selectingRef.current) {
+        setSelected((current) => {
+          const next = new Set(current);
+          if (!next.delete(peer.deviceId)) next.add(peer.deviceId);
+          return next;
+        });
+        return;
+      }
       if (pendingRef.current.length > 0) {
         await sendTo(peer, pendingRef.current);
         return;
@@ -192,6 +223,34 @@ export function App() {
     },
     [sendTo],
   );
+
+  // One drop, several devices: each is its own transfer, so each resumes,
+  // pauses and fails on its own, exactly as if sent one at a time.
+  const sendToSeveral = useCallback(async () => {
+    const paths = pendingRef.current;
+    const targets = peers.filter((peer) => selected.has(peer.deviceId));
+    if (paths.length === 0 || targets.length === 0) return;
+
+    const failures: string[] = [];
+    for (const peer of targets) {
+      try {
+        await api.sendToPeer(peer.deviceId, paths);
+      } catch (error) {
+        failures.push(`${peer.name}: ${String(error)}`);
+      }
+    }
+
+    setSelecting(false);
+    setSelected(new Set());
+    setPending([]);
+    setTab("transfers");
+    if (failures.length > 0) say(failures.join("\n"), true);
+  }, [peers, selected, say]);
+
+  const stopSelecting = useCallback(() => {
+    setSelecting(false);
+    setSelected(new Set());
+  }, []);
 
   // Files and folders need separate buttons because Windows has no dialog that
   // offers both — picking a folder is a distinct mode of the native dialog, not
@@ -219,49 +278,172 @@ export function App() {
     ["devices", "Devices", peers.length],
     ["transfers", "Transfers", active],
     ["history", "History", history.filter((r) => r.willRetry).length],
+    ["folders", "Folders", 0],
     ["browser", "Phone", texts.length],
     ["trusted", "Paired", 0],
     ["network", "Network", 0],
     ["settings", "Settings", 0],
   ];
 
-  return (
-    <div className="app">
-      <header className="header">
-        <div className="wordmark">
-          <img className="mark" src="./mark.png" alt="" aria-hidden="true" />
-          JETSTREAM
-        </div>
+  const openTab = (key: Tab) => {
+    setTab(key);
+    if (key === "trusted") refreshTrusted();
+    if (key === "history") refreshHistory();
+    // Cheap, and it clears the banner without a restart if the
+    // user allowed us through the firewall by other means.
+    if (key === "devices") void api.firewallStatus().then(setFirewall);
+    if (key === "folders") refreshTrusted();
+  };
 
-        <nav className="tabs" role="tablist">
-          {tabs.map(([key, label, count]) => (
-            <button
-              key={key}
-              role="tab"
-              className="tab"
-              aria-selected={tab === key}
-              onClick={() => {
-                setTab(key);
-                if (key === "trusted") refreshTrusted();
-                if (key === "history") refreshHistory();
-                // Cheap, and it clears the banner without a restart if the
-                // user allowed us through the firewall by other means.
-                if (key === "devices") void api.firewallStatus().then(setFirewall);
-              }}
-            >
-              {label}
-              {count > 0 && <span className="count">{count}</span>}
-            </button>
-          ))}
-        </nav>
+  const tabButtons = tabs.map(([key, label, count]) => (
+    <button
+      key={key}
+      role="tab"
+      className="tab"
+      aria-selected={tab === key}
+      onClick={() => openTab(key)}
+    >
+      {modern && <NavIcon tab={key} />}
+      <span className="label">{label}</span>
+      {count > 0 && <span className="count">{count}</span>}
+    </button>
+  ));
 
-        {self && (
-          <div className="identity">
-            <div className="name">{self.name}</div>
-            <div className="fp">{self.fingerprint}</div>
+  // What to send and to whom. The same choices in both interfaces; the modern
+  // one gives them a larger target to drop on.
+  const sendBar =
+    pending.length > 0 ? (
+      <div className={modern ? "hero ready" : "row"} style={modern ? undefined : { marginBottom: 14 }}>
+        <div style={{ flex: 1 }}>
+          <div className={modern ? "hero-title" : undefined}>
+            <strong>
+              {pending.length} item{pending.length === 1 ? "" : "s"} ready to send
+            </strong>
           </div>
+          <div className={modern ? "hero-sub" : undefined} style={modern ? undefined : { fontSize: 12, color: "var(--text-dim)" }}>
+            {selecting ? "Pick the devices, then send to all of them." : "Choose a device below."}
+          </div>
+        </div>
+        {selecting ? (
+          <>
+            <button
+              className="btn primary small"
+              disabled={selected.size === 0}
+              onClick={() => void sendToSeveral()}
+            >
+              Send to {selected.size} device{selected.size === 1 ? "" : "s"}
+            </button>
+            <button className="btn ghost small" onClick={stopSelecting}>
+              Back
+            </button>
+          </>
+        ) : (
+          <>
+            {peers.length > 1 && (
+              <button className="btn small" onClick={() => setSelecting(true)}>
+                Send to several…
+              </button>
+            )}
+            <button className="btn ghost small" onClick={() => setPending([])}>
+              Cancel
+            </button>
+          </>
         )}
-      </header>
+      </div>
+    ) : (
+      <div className={modern ? "hero" : "row"} style={modern ? undefined : { marginBottom: 14 }}>
+        <div style={{ flex: 1 }} className={modern ? undefined : "drop-hint"}>
+          {modern ? (
+            <>
+              <div className="hero-title">Drop files or folders anywhere</div>
+              <div className="hero-sub">or choose them, then pick a device below</div>
+            </>
+          ) : (
+            <span style={{ fontSize: 12, color: "var(--text-dim)" }}>
+              Drop anything on this window, or pick it here.
+            </span>
+          )}
+        </div>
+        <button className="btn small" onClick={() => void chooseAndArm(false)}>
+          Choose files…
+        </button>
+        <button className="btn small" onClick={() => void chooseAndArm(true)}>
+          Choose folder…
+        </button>
+        <button
+          className="btn ghost small"
+          onClick={() => setAdding(true)}
+          title="For a device on a VPN or another network, which will not appear by itself"
+        >
+          Add by address…
+        </button>
+      </div>
+    );
+
+  // The modern interface keeps what is moving in view on the main screen.
+  const running = transfers.filter(isRunning);
+  const inProgress = modern && running.length > 0 && (
+    <button className="in-progress" onClick={() => openTab("transfers")}>
+      <span className="in-progress-title">In progress</span>
+      {running.slice(0, 3).map((transfer) => {
+        const percent =
+          transfer.bytesTotal > 0 ? Math.min(100, (transfer.bytesDone / transfer.bytesTotal) * 100) : 0;
+        return (
+          <span className="mini" key={transfer.id}>
+            <span className="mini-who">
+              {transfer.direction === "sending" ? "→" : "←"} {transfer.peerName}
+            </span>
+            <span className="mini-bar">
+              <span style={{ width: `${percent}%` }} />
+            </span>
+            <span className="mini-num">
+              {formatPercent(transfer.bytesDone, transfer.bytesTotal)}
+              {transfer.rate > 0 && ` · ${formatRate(transfer.rate)}`}
+            </span>
+          </span>
+        );
+      })}
+      {running.length > 3 && <span className="mini-more">and {running.length - 3} more</span>}
+    </button>
+  );
+
+  return (
+    <div className={`app${modern ? " modern" : ""}`}>
+      {modern ? (
+        <aside className="sidebar">
+          <div className="wordmark">
+            <img className="mark" src="./mark.png" alt="" aria-hidden="true" />
+            JETSTREAM
+          </div>
+          <nav className="tabs" role="tablist" aria-orientation="vertical">
+            {tabButtons}
+          </nav>
+          {self && (
+            <div className="identity">
+              <div className="name">{self.name}</div>
+              <div className="fp">{self.fingerprint}</div>
+            </div>
+          )}
+        </aside>
+      ) : (
+        <header className="header">
+          <div className="wordmark">
+            <img className="mark" src="./mark.png" alt="" aria-hidden="true" />
+            JETSTREAM
+          </div>
+
+          <nav className="tabs" role="tablist">
+            {tabButtons}
+          </nav>
+
+          {self && (
+            <div className="identity">
+              <div className="name">{self.name}</div>
+              <div className="fp">{self.fingerprint}</div>
+            </div>
+          )}
+        </header>
+      )}
 
       <main className="body">
         {tab === "devices" && (
@@ -280,40 +462,8 @@ export function App() {
               </div>
             )}
 
-            {pending.length > 0 ? (
-              <div className="row" style={{ marginBottom: 14 }}>
-                <div style={{ flex: 1 }}>
-                  <strong>
-                    {pending.length} item{pending.length === 1 ? "" : "s"} ready to send
-                  </strong>
-                  <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
-                    Choose a device below.
-                  </div>
-                </div>
-                <button className="btn ghost small" onClick={() => setPending([])}>
-                  Cancel
-                </button>
-              </div>
-            ) : (
-              <div className="row" style={{ marginBottom: 14 }}>
-                <div style={{ flex: 1, fontSize: 12, color: "var(--text-dim)" }}>
-                  Drop anything on this window, or pick it here.
-                </div>
-                <button className="btn small" onClick={() => void chooseAndArm(false)}>
-                  Choose files…
-                </button>
-                <button className="btn small" onClick={() => void chooseAndArm(true)}>
-                  Choose folder…
-                </button>
-                <button
-                  className="btn ghost small"
-                  onClick={() => setAdding(true)}
-                  title="For a device on a VPN or another network, which will not appear by itself"
-                >
-                  Add by address…
-                </button>
-              </div>
-            )}
+            {sendBar}
+            {inProgress}
             {adding && (
               <AddDevice
                 onCancel={() => setAdding(false)}
@@ -332,6 +482,8 @@ export function App() {
               armed={pending.length > 0}
               onPick={(peer) => void pickPeer(peer)}
               onAddByAddress={() => setAdding(true)}
+              selecting={selecting}
+              selected={selected}
             />
           </>
         )}
@@ -339,6 +491,7 @@ export function App() {
         {tab === "transfers" && (
           <Transfers
             transfers={transfers}
+            modern={modern}
             onCancel={(id) => void api.cancelTransfer(id)}
             onPause={(id) => void api.pauseTransfer(id)}
             onReveal={(id) => {
@@ -372,12 +525,27 @@ export function App() {
                 say(`Forgot ${device.name}. It will ask again next time.`);
               });
             }}
+            onSetFolder={(device, folder) => {
+              void api
+                .setDeviceFolder(device.deviceId, folder)
+                .then(refreshTrusted)
+                .catch((e) => say(String(e), true));
+            }}
+            onWake={(device) => {
+              void api
+                .wakeDevice(device.deviceId)
+                .then(() =>
+                  say(`Sent ${device.name} a wake-up signal. It can take a minute to appear.`),
+                )
+                .catch((e) => say(String(e), true));
+            }}
           />
         )}
 
         {tab === "history" && (
           <History
             records={history}
+            modern={modern}
             onRetry={(record) => {
               void api
                 .retryTransfer(record.id)
@@ -396,6 +564,10 @@ export function App() {
           />
         )}
 
+        {tab === "folders" && (
+          <Folders peers={peers} trusted={trusted} onError={(message) => say(message, true)} />
+        )}
+
         {tab === "browser" && (
           <Browser
             texts={texts}
@@ -409,8 +581,9 @@ export function App() {
         {tab === "settings" && (
           <Settings
             self={self}
-            onSaved={(nameChanged) => {
+            onSaved={(nameChanged, saved) => {
               void api.getSelf().then(setSelf);
+              setUi(saved.interface);
               say(
                 nameChanged
                   ? "Saved. Other devices will see the new name within a few seconds."

@@ -968,3 +968,194 @@ async fn the_sender_shows_what_arrived_not_what_it_buffered() {
     assert_eq!(send_progress.bytes_done.load(Ordering::Relaxed), SIZE);
     assert_eq!(send_progress.bytes_moved.load(Ordering::Relaxed), SIZE);
 }
+
+/// Accept into `destination`, replacing anything already there.
+fn overwrite_into(
+    destination: &Path,
+) -> impl AsyncFnOnce(jetstream_core::proto::Offer) -> Decision + use<> {
+    let destination = destination.to_path_buf();
+    async move |_| Decision::Accept {
+        destination,
+        conflict: ConflictPolicy::Overwrite,
+    }
+}
+
+/// Text-like bytes that compress well, unlike `payload`.
+fn compressible(len: usize) -> Vec<u8> {
+    let line = b"2026-10-16 12:00:00 INFO transfer of chunk completed without incident\n";
+    line.iter().copied().cycle().take(len).collect()
+}
+
+const SAVE_ALWAYS: transfer::Options = transfer::Options {
+    saving: transfer::Saving::Always,
+};
+
+#[tokio::test]
+async fn compressible_data_crosses_the_wire_compressed_and_arrives_intact() {
+    const SIZE: usize = 12 * 1024 * 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("payload");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("server.log"), compressible(SIZE)).unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let (manifest, _) = Manifest::from_paths(std::slice::from_ref(&root)).unwrap();
+
+    let pair = connect_pair().await;
+    let progress = Arc::new(Progress::default());
+    let sending = {
+        let session = Arc::clone(&pair.sender);
+        let parent = dir.path().to_path_buf();
+        let manifest = manifest.clone();
+        tokio::spawn(async move {
+            transfer::send_with(&session, &parent, &manifest, Arc::new(Progress::default()), SAVE_ALWAYS).await
+        })
+    };
+
+    within(transfer::receive_with(
+        &pair.receiver,
+        accept_into(destination.path()),
+        Arc::clone(&progress),
+        SAVE_ALWAYS,
+    ))
+    .await
+    .unwrap();
+    within(sending).await.unwrap().unwrap();
+
+    assert_trees_match(&root, &destination.path().join("payload"));
+    assert_eq!(
+        progress.bytes_done.load(Ordering::Relaxed),
+        SIZE as u64,
+        "progress counts file bytes, compressed or not"
+    );
+    let wire = pair.receiver.wire_bytes_received();
+    assert!(
+        wire < SIZE as u64 / 4,
+        "{wire} bytes crossed the wire for {SIZE} bytes of very compressible data"
+    );
+}
+
+#[tokio::test]
+async fn incompressible_data_is_sent_as_it_is() {
+    let (_source_dir, root) = source_tree(&[("noise.bin", 6 * 1024 * 1024)]);
+    let destination = tempfile::tempdir().unwrap();
+    let (manifest, _) = Manifest::from_paths(std::slice::from_ref(&root)).unwrap();
+
+    let pair = connect_pair().await;
+    let sending = {
+        let session = Arc::clone(&pair.sender);
+        let parent = root.parent().unwrap().to_path_buf();
+        let manifest = manifest.clone();
+        tokio::spawn(async move {
+            transfer::send_with(&session, &parent, &manifest, Arc::new(Progress::default()), SAVE_ALWAYS).await
+        })
+    };
+
+    within(transfer::receive_with(
+        &pair.receiver,
+        accept_into(destination.path()),
+        Arc::new(Progress::default()),
+        SAVE_ALWAYS,
+    ))
+    .await
+    .unwrap();
+    within(sending).await.unwrap().unwrap();
+
+    assert_trees_match(&root, &destination.path().join("payload"));
+}
+
+/// Re-sending a large file that changed a little — a disk image, an archive
+/// that grew — moved the whole file again. Unchanged chunks of the older copy
+/// at the destination are now reused.
+#[tokio::test]
+async fn an_older_copy_at_the_destination_supplies_the_unchanged_chunks() {
+    const MIB: usize = 1024 * 1024;
+    let old = payload(16 * MIB, 7);
+    let mut new = old.clone();
+    // Change one chunk in the middle, and grow the file by a chunk and a half.
+    new[5 * MIB..5 * MIB + 100].fill(0xAA);
+    new.extend(payload(MIB + MIB / 2, 8));
+
+    let source = tempfile::tempdir().unwrap();
+    let root = source.path().join("payload");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("disk.img"), &new).unwrap();
+
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(destination.path().join("payload")).unwrap();
+    std::fs::write(destination.path().join("payload/disk.img"), &old).unwrap();
+
+    let (manifest, _) = Manifest::from_paths(std::slice::from_ref(&root)).unwrap();
+    let pair = connect_pair().await;
+    let progress = Arc::new(Progress::default());
+    let sending = {
+        let session = Arc::clone(&pair.sender);
+        let parent = source.path().to_path_buf();
+        let manifest = manifest.clone();
+        tokio::spawn(async move {
+            transfer::send_with(&session, &parent, &manifest, Arc::new(Progress::default()), SAVE_ALWAYS).await
+        })
+    };
+
+    within(transfer::receive_with(
+        &pair.receiver,
+        overwrite_into(destination.path()),
+        Arc::clone(&progress),
+        SAVE_ALWAYS,
+    ))
+    .await
+    .unwrap();
+    within(sending).await.unwrap().unwrap();
+
+    assert_eq!(std::fs::read(destination.path().join("payload/disk.img")).unwrap(), new);
+    assert_eq!(
+        progress.bytes_reused.load(Ordering::Relaxed),
+        15 * MIB as u64,
+        "every chunk but the changed one should come from the older copy"
+    );
+    assert_eq!(progress.bytes_done.load(Ordering::Relaxed), new.len() as u64);
+    let wire = pair.receiver.wire_bytes_received();
+    assert!(
+        wire < 6 * MIB as u64,
+        "{wire} bytes crossed the wire when about 2.5 MiB had changed"
+    );
+}
+
+/// On a LAN the default is to send, not to compare: the network is rarely the
+/// slow part there, and comparing costs a read of the file on both sides.
+#[tokio::test]
+async fn by_default_a_lan_transfer_does_not_compare_older_copies() {
+    const MIB: usize = 1024 * 1024;
+    let data = payload(10 * MIB, 9);
+
+    let source = tempfile::tempdir().unwrap();
+    let root = source.path().join("payload");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("disk.img"), &data).unwrap();
+
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(destination.path().join("payload")).unwrap();
+    std::fs::write(destination.path().join("payload/disk.img"), &data).unwrap();
+
+    let (manifest, _) = Manifest::from_paths(std::slice::from_ref(&root)).unwrap();
+    let pair = connect_pair().await;
+    let progress = Arc::new(Progress::default());
+    let sending = {
+        let session = Arc::clone(&pair.sender);
+        let parent = source.path().to_path_buf();
+        tokio::spawn(async move {
+            transfer::send(&session, &parent, &manifest, Arc::new(Progress::default())).await
+        })
+    };
+
+    within(transfer::receive(
+        &pair.receiver,
+        overwrite_into(destination.path()),
+        Arc::clone(&progress),
+    ))
+    .await
+    .unwrap();
+    within(sending).await.unwrap().unwrap();
+
+    assert_eq!(progress.bytes_reused.load(Ordering::Relaxed), 0);
+    assert_eq!(std::fs::read(destination.path().join("payload/disk.img")).unwrap(), data);
+}
