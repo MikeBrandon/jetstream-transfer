@@ -39,6 +39,9 @@ impl Mdns {
     pub fn start(device_id: DeviceId, name: &str, transfer_port: u16) -> Result<Self, mdns_sd::Error> {
         let daemon = ServiceDaemon::new()?;
 
+        // Before registering, so the advertisement never goes out on them.
+        exclude_tunnel_interfaces(&daemon);
+
         let service = advertisement(device_id, name, transfer_port)?;
         let fullname = service.get_fullname().to_string();
         daemon.register(service)?;
@@ -244,5 +247,38 @@ impl Drop for Mdns {
         // waiting out the TTL and offering the user a device that is gone.
         let _ = self.daemon.unregister(&self.fullname);
         let _ = self.daemon.shutdown();
+    }
+}
+
+/// Keep Teredo and 6to4 interfaces out of mDNS entirely.
+///
+/// Ranking those addresses last on the *dialling* side fixes the choice, but
+/// only once the other device runs a build that knows to. Not advertising them
+/// from this side fixes it immediately for every peer, old builds included: an
+/// address that is never offered cannot be picked. Measured case: a transfer
+/// between two Radmin-connected machines ran entirely over Teredo because the
+/// receiver advertised its Teredo address and the sender ranked it above Radmin.
+///
+/// Matched by address prefix rather than adapter name, because the name is
+/// localised — "Teredo Tunneling Pseudo-Interface" on English Windows only.
+/// Best-effort: an interface that cannot be disabled is logged and left alone,
+/// since mDNS working on a tunnel is still better than mDNS not starting.
+fn exclude_tunnel_interfaces(daemon: &ServiceDaemon) {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return;
+    };
+
+    for interface in interfaces {
+        let if_addrs::IfAddr::V6(v6) = &interface.addr else {
+            continue;
+        };
+        if !crate::is_tunnelled_ipv6(&v6.ip) {
+            continue;
+        }
+
+        match daemon.disable_interface(mdns_sd::IfKind::Addr(std::net::IpAddr::V6(v6.ip))) {
+            Ok(()) => tracing::debug!(interface = %interface.name, "not advertising on a tunnel interface"),
+            Err(e) => tracing::debug!(interface = %interface.name, error = %e, "could not exclude a tunnel interface from mDNS"),
+        }
     }
 }
