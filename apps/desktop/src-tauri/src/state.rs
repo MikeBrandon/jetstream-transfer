@@ -215,6 +215,24 @@ pub fn parse_interface(text: &str) -> String {
     if text == "modern" { "modern" } else { "classic" }.to_string()
 }
 
+/// The local link's speed, but only when that is what limits the transfer.
+///
+/// For a LAN peer, the adapter's negotiated speed *is* the ceiling, and showing
+/// it is what turns "why is this slow" into "this is as fast as the cable goes".
+/// For anything that leaves the building — a VPN, Teredo, the internet — the
+/// local adapter is the fastest part of the path, not the slowest. A receive over
+/// a ~12 Mbps internet connection was labelled "100 Mbps link", which invites
+/// exactly the wrong conclusion: that the app is wasting 90% of the wire.
+///
+/// Saying nothing is honest; the real ceiling there is somebody's internet plan,
+/// which the app cannot see.
+fn link_ceiling_for(peer: std::net::SocketAddr) -> Option<u64> {
+    if !jetstream_core::transport::quic::is_lan(peer) {
+        return None;
+    }
+    jetstream_discovery::linkspeed::to_peer(peer)
+}
+
 pub fn parse_conflict(text: &str) -> ConflictPolicy {
     match text {
         "overwrite" => ConflictPolicy::Overwrite,
@@ -669,7 +687,7 @@ impl AppState {
     /// Takes the address the connection actually used, which is the only
     /// trustworthy input — the peer may advertise several.
     pub fn note_link_speed(&self, id: u64, peer: std::net::SocketAddr) {
-        let speed = jetstream_discovery::linkspeed::to_peer(peer);
+        let speed = link_ceiling_for(peer);
         let mut transfers = self.transfers.lock().expect("transfers poisoned");
         if let Some(transfer) = transfers.get_mut(&id) {
             transfer.link_bps = speed;
@@ -828,4 +846,30 @@ pub fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod link_ceiling_tests {
+    use super::link_ceiling_for;
+
+    /// Regression: a receive over a ~12 Mbps internet connection showed
+    /// "100 Mbps link" — the local Ethernet, which was never the bottleneck.
+    #[test]
+    fn no_ceiling_is_claimed_for_a_path_that_leaves_the_building() {
+        for remote in [
+            // Radmin and Tailscale, as VPN peers appear.
+            "26.238.192.96:4646",
+            "100.101.102.103:4646",
+            // Teredo, the path the measured transfer actually took.
+            "[2001:0:14c9:d700:476:233b:992e:c79d]:4646",
+            // An ordinary public address.
+            "203.0.113.10:4646",
+        ] {
+            assert_eq!(
+                link_ceiling_for(remote.parse().unwrap()),
+                None,
+                "{remote} is not limited by the local adapter"
+            );
+        }
+    }
 }

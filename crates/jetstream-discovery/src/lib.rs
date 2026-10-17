@@ -188,7 +188,15 @@ impl DiscoveredPeer {
             //
             // Receiving from an address proves the peer can reach us. It does not
             // prove we can reach the peer, and for APIPA those differ.
-            let trustworthy = self.observed.contains(address) && !is_apipa(address);
+            //
+            // Nor for a tunnelled IPv6 address, for a different reason: it is
+            // reachable, just badly. One transfer that succeeds over Teredo marks
+            // it observed, and without this it would then outrank a perfectly
+            // good VPN address on every attempt after — a slow path that, once
+            // chosen, chooses itself for ever.
+            let trustworthy = self.observed.contains(address)
+                && !is_apipa(address)
+                && !is_tunnelled(address);
             (!trustworthy, address_rank(address))
         });
         addresses
@@ -216,7 +224,19 @@ fn address_rank(address: &SocketAddr) -> u8 {
         && is_ipv6_link_local(&v6)
     {
         let scoped = matches!(address, SocketAddr::V6(v6) if v6.scope_id() != 0);
-        return if scoped { 3 } else { 5 };
+        return if scoped { 3 } else { 6 };
+    }
+
+    // Teredo and 6to4: IPv6 carried inside IPv4 by a transition mechanism, not
+    // a real IPv6 path. They look like ordinary global addresses, which is the
+    // problem — ranked as such they beat VPN addresses, and a transfer between
+    // two machines on Radmin was measured running entirely through Teredo
+    // (Microsoft's relay, behind a symmetric NAT) while the Radmin adapter sat
+    // idle. Last of everything that can actually deliver a packet: below APIPA,
+    // which is fast when it works, and above only an unscoped `fe80::`, which
+    // cannot be sent anywhere.
+    if is_tunnelled(address) {
+        return 5;
     }
 
     match address.ip() {
@@ -237,6 +257,24 @@ fn address_rank(address: &SocketAddr) -> u8 {
 
 fn is_ipv6_link_local(address: &std::net::Ipv6Addr) -> bool {
     address.segments()[0] & 0xffc0 == 0xfe80
+}
+
+/// An IPv6 address that is really IPv4 underneath.
+///
+/// - **Teredo**, `2001:0000::/32` — tunnels through UDP via Microsoft's relays,
+///   and Windows enables it by default, so most machines have one.
+/// - **6to4**, `2002::/16` — the same idea through public relay routers, long
+///   deprecated but still configured on some systems.
+///
+/// Both work, slowly and erratically, and neither is what anyone means by an
+/// IPv6 connection.
+pub fn is_tunnelled_ipv6(address: &std::net::Ipv6Addr) -> bool {
+    let segments = address.segments();
+    (segments[0] == 0x2001 && segments[1] == 0x0000) || segments[0] == 0x2002
+}
+
+fn is_tunnelled(address: &SocketAddr) -> bool {
+    matches!(address.ip(), std::net::IpAddr::V6(v6) if is_tunnelled_ipv6(&v6))
 }
 
 /// A sighting reported by one of the mechanisms.
@@ -780,6 +818,73 @@ mod tests {
         assert!(ordered[0].ip().to_string().starts_with("192.168"));
         assert_eq!(ordered[1].ip().to_string(), "169.254.83.107");
         assert_eq!(ordered.last().unwrap().ip().to_string(), "fe80::1");
+    }
+
+    /// Regression from a real transfer between two machines on Radmin VPN.
+    ///
+    /// The Radmin adapter carried under 1.5 KB/s while Windows' Teredo tunnel
+    /// carried the whole transfer at ~1 MB/s, behind a symmetric NAT. The
+    /// sender had ranked the receiver's Teredo address — `2001:0::/32`, which
+    /// looks like ordinary global IPv6 — above its Radmin address.
+    #[test]
+    fn a_vpn_address_beats_a_teredo_address_even_once_teredo_has_worked() {
+        let radmin = SocketAddr::from((Ipv4Addr::new(26, 238, 192, 96), 4646));
+        let teredo: SocketAddr = "[2001:0:14c9:d700:476:233b:992e:c79d]:4646".parse().unwrap();
+
+        let peer = DiscoveredPeer {
+            device_id: device(1),
+            name: "Friend".into(),
+            addresses: vec![teredo, radmin],
+            // The worst case: Teredo already carried a transfer, so it is
+            // observed, while the Radmin address is only claimed.
+            observed: BTreeSet::from([teredo]),
+            sources: BTreeSet::from([Source::Mdns, Source::Known]),
+            last_seen: Instant::now(),
+            mdns_present: true,
+        };
+
+        assert_eq!(
+            peer.best_address(),
+            Some(radmin),
+            "a tunnel through Microsoft's relays must not beat the VPN"
+        );
+        assert!(
+            peer.addresses_by_preference().contains(&teredo),
+            "still kept as a last resort — some peers have nothing else"
+        );
+    }
+
+    #[test]
+    fn tunnelled_ipv6_is_recognised_and_real_ipv6_is_not() {
+        use std::net::Ipv6Addr;
+        let parse = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+
+        // Teredo and 6to4.
+        assert!(is_tunnelled_ipv6(&parse("2001:0:14c9:d700:476:233b:992e:c79d")));
+        assert!(is_tunnelled_ipv6(&parse("2002:c000:204::1")));
+
+        // Ordinary global IPv6 — including other 2001: blocks, which is the trap:
+        // only 2001:0000::/32 is Teredo, not everything starting 2001.
+        assert!(!is_tunnelled_ipv6(&parse("2001:db8::1")));
+        assert!(!is_tunnelled_ipv6(&parse("2001:4860:4860::8888")));
+        assert!(!is_tunnelled_ipv6(&parse("2606:4700:4700::1111")));
+        assert!(!is_tunnelled_ipv6(&parse("fe80::1")));
+    }
+
+    #[test]
+    fn a_tunnel_ranks_below_everything_that_can_really_deliver() {
+        let teredo: SocketAddr = "[2001:0:14c9:d700::1]:4646".parse().unwrap();
+        let six_to_four: SocketAddr = "[2002:c000:204::1]:4646".parse().unwrap();
+        let real_v6: SocketAddr = "[2606:4700::1]:4646".parse().unwrap();
+        let apipa = SocketAddr::from((Ipv4Addr::new(169, 254, 1, 2), 4646));
+        let unscoped: SocketAddr = "[fe80::1]:4646".parse().unwrap();
+
+        for tunnel in [teredo, six_to_four] {
+            assert!(address_rank(&real_v6) < address_rank(&tunnel), "real IPv6 beats {tunnel}");
+            assert!(address_rank(&apipa) < address_rank(&tunnel), "APIPA beats {tunnel}");
+            // But a tunnel can deliver; an unscoped fe80 cannot be sent at all.
+            assert!(address_rank(&tunnel) < address_rank(&unscoped));
+        }
     }
 
     /// Regression from a direct-cable failure where every address timed out.
