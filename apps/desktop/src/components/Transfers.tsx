@@ -16,6 +16,7 @@ import {
   formatPercent,
   formatRate,
   isRunning,
+  type CheckView,
   type TransferView,
 } from "../api";
 import { Sparkline } from "./Sparkline";
@@ -131,6 +132,47 @@ function linkNote(transfer: TransferView): string | undefined {
   return `${linkLabel} link`;
 }
 
+/**
+ * What a check is, in words. Direction matters for the comparison: the receiver
+ * compares against the copy it already has, the sender reads its original so
+ * the receiver can compare.
+ */
+function checkLabel(check: CheckView, peer: string, sending: boolean): string {
+  switch (check.kind) {
+    case "comparing":
+      return sending ? `Comparing with ${peer}'s copy` : "Comparing with your copy";
+    case "verifying":
+      return "Verifying the file";
+    case "waitingForPeer":
+      return `Waiting for ${peer}`;
+  }
+}
+
+function checkValue(check: CheckView, sending: boolean): string {
+  if (check.kind === "waitingForPeer" || check.total === 0) return "checking…";
+  // The sender answers a comparison in batches it cannot see the end of, so a
+  // percentage there would climb to 100% and restart per batch. Better to show
+  // none than a number that goes backwards.
+  if (check.kind === "comparing" && sending) return "checking…";
+  const percent = Math.min(100, Math.floor((check.done / check.total) * 100));
+  // A comparison counts two reads - theirs and ours - so its total is twice the
+  // file. Naming that size would read as a mistake; the percentage alone is right.
+  if (check.kind === "comparing") return `${percent}%`;
+  return `${percent}% of ${formatBytes(check.total)}`;
+}
+
+/** One line on *why*, so a pause reads as care rather than a fault. */
+function checkNote(check: CheckView, peer: string): string {
+  switch (check.kind) {
+    case "comparing":
+      return "finding the parts already there, so they aren't sent again";
+    case "verifying":
+      return "reading it back to confirm nothing was damaged";
+    case "waitingForPeer":
+      return `${peer} is checking its copy matches`;
+  }
+}
+
 export function Transfers({
   transfers,
   onCancel,
@@ -189,6 +231,17 @@ export function Transfers({
           transfer.bytesDone === 0;
         const active = transfer.state === "active";
 
+        // A whole-file read with no data moving: comparing before the first byte,
+        // or verifying after the last. Shown in place of the speed and time left,
+        // which at those moments read "5 B/s, 1s left" and look like a hang.
+        // Only when data has stopped - a big file verifying while others still
+        // stream is not a stall, and the speed is the more useful number then.
+        const check = transfer.check;
+        const checking =
+          check !== null &&
+          isRunning(transfer) &&
+          (percent >= 100 || pending || transfer.rate < 64 * 1024);
+
         // A declined transfer never moved a byte, so "0%" is a number with
         // nothing behind it — the chip already says what happened. A *failed*
         // one keeps its figure, because how far it got is worth knowing.
@@ -234,7 +287,9 @@ export function Transfers({
                 {/* Only the state label lives up here now. The numbers moved
                     down into their own cells, where each one is legible. */}
                 {!active && label && (
-                  <span className={`chip ${chip}`.trim()}>{label}</span>
+                  <span className={`chip ${chip}`.trim()}>
+                    {checking ? "checking…" : label}
+                  </span>
                 )}
 
                 {/* Throttling only makes sense while bytes are moving, and the
@@ -300,13 +355,21 @@ export function Transfers({
               )}
             </div>
 
-            {active && (
+            {(active || checking) && (
               <div className="stats">
                 {modern && (
                   <div className="stat graph">
                     <Sparkline values={transfer.rateHistory} />
                   </div>
                 )}
+                {checking && check ? (
+                  <Stat
+                    label={checkLabel(check, transfer.peerName, sending)}
+                    value={checkValue(check, sending)}
+                    note={checkNote(check, transfer.peerName)}
+                  />
+                ) : (
+                  <>
                 <Stat
                   label="Speed"
                   value={transfer.rate > 0 ? formatRate(transfer.rate) : "—"}
@@ -322,6 +385,8 @@ export function Transfers({
                   label="Time left"
                   value={transfer.eta !== null ? formatEta(transfer.eta) : "—"}
                 />
+                  </>
+                )}
                 <Stat
                   label="Transferred"
                   value={`${formatBytes(transfer.bytesDone)} of ${formatBytes(transfer.bytesTotal)}`}

@@ -619,6 +619,16 @@ impl Staging {
     /// file is re-requested from scratch rather than left as plausible-looking
     /// corruption.
     pub fn finish_file(&mut self, index: u32, expected_hash: &[u8; 32]) -> Result<Placement> {
+        let actual = self.hash_staged_file(index, &mut |_| {})?;
+        self.place_verified(index, &actual, expected_hash)
+    }
+
+    /// Read a fully staged file back and hash it, reporting bytes read as it goes.
+    ///
+    /// The first half of [`Staging::finish_file`], split out so the slow part -
+    /// reading the whole file - can overlap with the other device reading its
+    /// copy, and can report progress instead of looking like a stall.
+    pub fn hash_staged_file(&mut self, index: u32, on_read: &mut dyn FnMut(u64)) -> Result<[u8; 32]> {
         if !self.is_file_complete(index) {
             return Err(Error::Protocol(format!(
                 "entry {index} is not fully staged yet"
@@ -627,10 +637,19 @@ impl Staging {
 
         self.checkpoint(index)?;
         self.close_handle(index);
+        hash_file_reporting(&self.part_path(index), on_read)
+    }
 
+    /// The second half of [`Staging::finish_file`]: compare, then deliver or
+    /// discard. Takes the hash [`Staging::hash_staged_file`] computed.
+    pub fn place_verified(
+        &mut self,
+        index: u32,
+        actual: &[u8; 32],
+        expected_hash: &[u8; 32],
+    ) -> Result<Placement> {
         let part = self.part_path(index);
-        let actual = hash_file(&part)?;
-        if &actual != expected_hash {
+        if actual != expected_hash {
             tracing::warn!(
                 index,
                 path = %self.manifest.entries[index as usize].path,
@@ -965,7 +984,8 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<[u8; 32]> {
+/// BLAKE3 of a whole file, calling `on_read` with the size of each block read.
+fn hash_file_reporting(path: &Path, on_read: &mut dyn FnMut(u64)) -> Result<[u8; 32]> {
     let mut file = File::open(to_extended_length(path))?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 256 * 1024];
@@ -976,6 +996,7 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
             break;
         }
         hasher.update(&buffer[..read]);
+        on_read(read as u64);
     }
     Ok(*hasher.finalize().as_bytes())
 }
@@ -1489,6 +1510,45 @@ mod tests {
         assert!(dir.path().join("tree/empty-dir").is_dir());
         assert!(dir.path().join("tree/empty-file.txt").is_file());
         assert_eq!(fs::metadata(dir.path().join("tree/empty-file.txt")).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn hashing_then_placing_delivers_a_matching_file_and_reports_every_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = payload(CHUNK_SIZE as usize * 3 + 77, 21);
+        let manifest = Manifest {
+            entries: vec![entry("big.bin", data.len() as u64)],
+        };
+        let mut staging = Staging::open(dir.path(), manifest, ConflictPolicy::Rename).unwrap();
+        send_all(&mut staging, 0, &data);
+
+        let mut reported = 0u64;
+        let local = staging.hash_staged_file(0, &mut |n| reported += n).unwrap();
+        assert_eq!(reported, data.len() as u64, "progress must account for the whole file");
+
+        staging
+            .place_verified(0, &local, blake3::hash(&data).as_bytes())
+            .unwrap();
+        assert_eq!(fs::read(dir.path().join("big.bin")).unwrap(), data);
+    }
+
+    #[test]
+    fn a_mismatch_after_a_split_verify_is_refused_and_fetched_again() {
+        // The split must keep the old guarantee: a file whose hash does not match
+        // never reaches the destination, and is queued to be fetched again.
+        let dir = tempfile::tempdir().unwrap();
+        let data = payload(CHUNK_SIZE as usize * 2, 22);
+        let manifest = Manifest {
+            entries: vec![entry("big.bin", data.len() as u64)],
+        };
+        let mut staging = Staging::open(dir.path(), manifest, ConflictPolicy::Rename).unwrap();
+        send_all(&mut staging, 0, &data);
+
+        let local = staging.hash_staged_file(0, &mut |_| {}).unwrap();
+        let wrong = [7u8; 32];
+        assert!(staging.place_verified(0, &local, &wrong).is_err());
+        assert!(!dir.path().join("big.bin").exists(), "must never be delivered");
+        assert!(!staging.outstanding().is_empty(), "must be fetched again");
     }
 
     #[test]

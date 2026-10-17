@@ -65,6 +65,17 @@ export interface TrustedView {
   canWake: boolean;
 }
 
+/**
+ * A step that reads a whole file instead of moving data, and so would otherwise
+ * look like a stall. `done`/`total` are bytes; both are 0 for `waitingForPeer`,
+ * whose work is on the other machine and cannot be measured here.
+ */
+export interface CheckView {
+  kind: "comparing" | "verifying" | "waitingForPeer";
+  done: number;
+  total: number;
+}
+
 export interface TransferView {
   id: number;
   direction: Direction;
@@ -91,6 +102,8 @@ export interface TransferView {
   detail: string | null;
   startedAt: number;
   resumable: boolean;
+  /** A whole-file read under way instead of data moving, or null. */
+  check: CheckView | null;
   /** Speed over the last minute, one reading a second, oldest first. */
   rateHistory: number[];
   /** Bytes copied from an older copy at the destination instead of sent. */
