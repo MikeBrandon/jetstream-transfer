@@ -106,6 +106,9 @@ pub struct Settings {
     pub folder_per_device: bool,
     /// `classic` or `modern`. Only the window reads it.
     pub interface: String,
+    /// Pacing for connections to internet and VPN peers. See
+    /// [`jetstream_core::transport::quic::RemoteCongestion`].
+    pub remote_congestion: jetstream_core::transport::quic::RemoteCongestion,
 }
 
 impl Settings {
@@ -131,6 +134,7 @@ impl Settings {
                 saving: parse_saving(&view.bandwidth_saving),
                 folder_per_device: view.folder_per_device,
                 interface: parse_interface(&view.interface),
+                remote_congestion: parse_remote_congestion(&view.remote_congestion),
             },
             None => Self::default(),
         }
@@ -164,6 +168,11 @@ impl Settings {
             .to_string(),
             folder_per_device: self.folder_per_device,
             interface: self.interface.clone(),
+            remote_congestion: match self.remote_congestion {
+                jetstream_core::transport::quic::RemoteCongestion::Standard => "standard",
+                jetstream_core::transport::quic::RemoteCongestion::Bbr => "bbr",
+            }
+            .to_string(),
         }
     }
 
@@ -198,6 +207,8 @@ impl Default for Settings {
             saving: Saving::Auto,
             folder_per_device: false,
             interface: "classic".into(),
+            // Off unless someone opts in. See RemoteCongestion::Bbr.
+            remote_congestion: jetstream_core::transport::quic::RemoteCongestion::Standard,
         }
     }
 }
@@ -207,6 +218,18 @@ pub fn parse_saving(text: &str) -> Saving {
         "always" => Saving::Always,
         "never" => Saving::Never,
         _ => Saving::Auto,
+    }
+}
+
+/// `bbr` opts in; anything else, including a value this build does not know,
+/// is the standard controller. Failing safe matters here: an unrecognised value
+/// must never switch on the experimental path.
+pub fn parse_remote_congestion(text: &str) -> jetstream_core::transport::quic::RemoteCongestion {
+    use jetstream_core::transport::quic::RemoteCongestion;
+    if text == "bbr" {
+        RemoteCongestion::Bbr
+    } else {
+        RemoteCongestion::Standard
     }
 }
 
@@ -491,6 +514,8 @@ impl AppState {
                 Endpoint::bind_all(Arc::clone(&identity), settings.device_name.clone(), 0)?
             }
         };
+
+        endpoint.set_remote_congestion(settings.remote_congestion);
 
         let port = endpoint.local_addr().map(|a| a.port()).unwrap_or(DEFAULT_PORT);
         let discovery = Discovery::start(identity.device_id(), &settings.device_name, port);
@@ -871,5 +896,57 @@ mod link_ceiling_tests {
                 "{remote} is not limited by the local adapter"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_congestion_settings_tests {
+    use super::{Settings, parse_remote_congestion};
+    use jetstream_core::transport::quic::RemoteCongestion;
+
+    /// The upgrade guarantee: a settings file saved by 0.2.1 or earlier has no
+    /// such field, and loading it must leave the behaviour exactly as it was.
+    #[test]
+    fn a_settings_file_from_before_this_option_loads_as_standard() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{
+                "deviceName": "Old Build",
+                "downloadDir": "C:/Downloads/Jetstream",
+                "onConflict": "rename",
+                "sendLimitKbps": 0,
+                "receiveLimitKbps": 0,
+                "bandwidthSaving": "auto",
+                "folderPerDevice": false,
+                "interface": "classic"
+            }"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(dir.path());
+        assert_eq!(settings.device_name, "Old Build", "the rest of the file still loads");
+        assert_eq!(settings.remote_congestion, RemoteCongestion::Standard);
+    }
+
+    #[test]
+    fn the_choice_survives_a_save_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            remote_congestion: RemoteCongestion::Bbr,
+            ..Settings::default()
+        };
+        settings.save(dir.path()).unwrap();
+
+        assert_eq!(Settings::load(dir.path()).remote_congestion, RemoteCongestion::Bbr);
+    }
+
+    #[test]
+    fn anything_unrecognised_fails_safe_to_standard() {
+        // Only an explicit opt-in may reach the experimental path.
+        for text in ["", "standard", "BBR", "bbr2", "cubic", "garbage"] {
+            assert_eq!(parse_remote_congestion(text), RemoteCongestion::Standard, "{text:?}");
+        }
+        assert_eq!(parse_remote_congestion("bbr"), RemoteCongestion::Bbr);
     }
 }

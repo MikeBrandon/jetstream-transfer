@@ -258,7 +258,11 @@ pub fn save_settings(state: State<'_, Arc<AppState>>, settings: SettingsView) ->
     current.saving = crate::state::parse_saving(&settings.bandwidth_saving);
     current.folder_per_device = settings.folder_per_device;
     current.interface = crate::state::parse_interface(&settings.interface);
+    current.remote_congestion = crate::state::parse_remote_congestion(&settings.remote_congestion);
     current.save(&state.data_dir).map_err(|e| e.to_string())?;
+
+    // From the next connection on; one already open keeps its controller.
+    state.endpoint.set_remote_congestion(current.remote_congestion);
 
     if name_changed {
         state.endpoint.rename(&current.device_name);

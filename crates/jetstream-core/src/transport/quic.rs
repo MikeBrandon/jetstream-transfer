@@ -102,15 +102,70 @@ const INITIAL_WINDOW: u64 = 1024 * 1024;
 const SOCKET_BUFFER: usize = 8 * 1024 * 1024;
 
 /// A bound QUIC endpoint that can accept and initiate sessions.
+/// How a connection to a peer *off* the local network paces itself.
+///
+/// LAN connections are unaffected by this: they keep the tuned Cubic setup that
+/// was measured saturating gigabit Ethernet, whatever this is set to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RemoteCongestion {
+    /// Cubic, quinn's default. Loss-based: it speeds up until packets drop, so on
+    /// a link with an oversized buffer it fills the buffer first, which shows up
+    /// as latency in the seconds and a rate that saws up and down.
+    #[default]
+    Standard,
+    /// BBR. Paces at its estimate of the bottleneck's rate instead of probing
+    /// for loss, which keeps queues short on over-buffered links.
+    ///
+    /// **Opt-in, and labelled experimental**, because quinn's own documentation
+    /// says of its implementation "Experimental! Use at your own risk." It is
+    /// also known to compete hard with other traffic on the same line. It cannot
+    /// harm data or compatibility — pacing is local to the sender and invisible
+    /// to the protocol — so the worst case is a slower or less even transfer,
+    /// undone by switching back.
+    Bbr,
+}
+
+/// Whether a connection should use BBR.
+///
+/// Never on a LAN, whatever the setting: that path has its own measured tuning,
+/// and the setting is described to users as affecting internet and VPN peers
+/// only.
+fn uses_bbr(lan: bool, remote: RemoteCongestion) -> bool {
+    !lan && remote == RemoteCongestion::Bbr
+}
+
 #[derive(Clone)]
 pub struct Endpoint {
     inner: quinn::Endpoint,
     identity: Arc<Identity>,
     /// Shared by every clone, so a rename reaches whichever one dials next.
     local_name: Arc<std::sync::RwLock<String>>,
+    /// The `RemoteCongestion` choice, as its discriminant. Shared by every clone
+    /// for the same reason as `local_name`: a settings change must reach the
+    /// next dial without rebuilding the endpoint.
+    remote_congestion: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl Endpoint {
+    /// Choose how connections to non-LAN peers pace themselves. Takes effect
+    /// from the next connection this endpoint dials; one already open keeps the
+    /// controller it started with.
+    pub fn set_remote_congestion(&self, choice: RemoteCongestion) {
+        let value = match choice {
+            RemoteCongestion::Standard => 0,
+            RemoteCongestion::Bbr => 1,
+        };
+        self.remote_congestion
+            .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn remote_congestion(&self) -> RemoteCongestion {
+        match self.remote_congestion.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => RemoteCongestion::Bbr,
+            _ => RemoteCongestion::Standard,
+        }
+    }
+
     /// Bind to `addr`.
     ///
     /// Pass port 0 to let the OS choose; read it back with [`Endpoint::local_addr`].
@@ -136,6 +191,7 @@ impl Endpoint {
             inner,
             identity,
             local_name: Arc::new(std::sync::RwLock::new(proto_name(local_name.into()))),
+            remote_congestion: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
     }
 
@@ -183,13 +239,27 @@ impl Endpoint {
     /// for deliberate first contact, and show the resulting fingerprint to the
     /// user before trusting it.
     pub async fn connect(&self, addr: SocketAddr, expected: Option<DeviceId>) -> Result<Arc<Session>> {
+        // The dialer is the side that sends the files, so its congestion
+        // settings are the ones that matter — and it knows where it is dialling.
+        let transport = transport_config_for(is_lan(addr), self.remote_congestion());
+        self.connect_using(addr, expected, transport).await
+    }
+
+    /// `connect`, with the transport settings supplied by the caller.
+    ///
+    /// Separate so tests can force a configuration that the address alone would
+    /// never select — BBR over loopback, in particular.
+    async fn connect_using(
+        &self,
+        addr: SocketAddr,
+        expected: Option<DeviceId>,
+        transport: quinn::TransportConfig,
+    ) -> Result<Arc<Session>> {
         let crypto = QuicClientConfig::try_from(tls::client_config(&self.identity, expected)?)
             .map_err(|e| Error::Crypto(format!("QUIC rejected the TLS config: {e}")))?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-        // The dialer is the side that sends the files, so its congestion
-        // settings are the ones that matter — and it knows where it is dialling.
-        client_config.transport_config(Arc::new(transport_config_for(is_lan(addr))));
+        client_config.transport_config(Arc::new(transport));
 
         let connection = self
             .inner
@@ -272,7 +342,12 @@ impl Endpoint {
             .map_err(|e| Error::Crypto(format!("QUIC rejected the TLS config: {e}")))?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-        client_config.transport_config(Arc::new(transport_config_for(is_lan(addr))));
+        // A probe hangs up before any data moves, so pacing is irrelevant and the
+        // experimental controller has no business on a reachability check.
+        client_config.transport_config(Arc::new(transport_config_for(
+            is_lan(addr),
+            RemoteCongestion::Standard,
+        )));
 
         let connection = self
             .inner
@@ -392,11 +467,13 @@ pub fn is_lan(addr: SocketAddr) -> bool {
 
 /// Transport settings for the listening side, which mostly receives.
 fn transport_config() -> quinn::TransportConfig {
-    transport_config_for(true)
+    // The listening side mostly receives, and its pacing only governs
+    // acknowledgements, so it keeps the defaults.
+    transport_config_for(true, RemoteCongestion::Standard)
 }
 
 /// Transport settings, tuned for a LAN or left conservative for anything else.
-fn transport_config_for(lan: bool) -> quinn::TransportConfig {
+fn transport_config_for(lan: bool, remote: RemoteCongestion) -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config
         .max_idle_timeout(Some(
@@ -411,6 +488,10 @@ fn transport_config_for(lan: bool) -> quinn::TransportConfig {
         // link and throttles a LAN transfer to one chunk in flight.
         .stream_receive_window(STREAM_RECEIVE_WINDOW.into())
         .send_window(SEND_WINDOW);
+
+    if uses_bbr(lan, remote) {
+        config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
 
     if !lan {
         // A VPN tunnel or the internet: quinn's defaults are tuned for exactly
@@ -595,5 +676,93 @@ mod scope_id_tests {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod congestion_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_changes_nothing() {
+        // Existing behaviour must be untouched unless someone opts in.
+        assert_eq!(RemoteCongestion::default(), RemoteCongestion::Standard);
+        assert!(!uses_bbr(false, RemoteCongestion::default()));
+        assert!(!uses_bbr(true, RemoteCongestion::default()));
+    }
+
+    #[test]
+    fn a_lan_never_uses_bbr_whatever_the_setting() {
+        // The setting is described as affecting internet and VPN peers only, and
+        // the LAN path has its own measured tuning that must not be displaced.
+        assert!(!uses_bbr(true, RemoteCongestion::Bbr));
+    }
+
+    #[test]
+    fn bbr_applies_only_to_remote_peers_that_opted_in() {
+        assert!(uses_bbr(false, RemoteCongestion::Bbr));
+    }
+
+    #[tokio::test]
+    async fn a_choice_reaches_every_clone_of_the_endpoint() {
+        // The app hands clones of one endpoint to different tasks; a settings
+        // change has to reach whichever one dials next.
+        let a = Endpoint::bind_all(Arc::new(Identity::generate().unwrap()), "a", 0).unwrap();
+        let b = a.clone();
+        a.set_remote_congestion(RemoteCongestion::Bbr);
+        assert_eq!(b.remote_congestion(), RemoteCongestion::Bbr);
+        b.set_remote_congestion(RemoteCongestion::Standard);
+        assert_eq!(a.remote_congestion(), RemoteCongestion::Standard);
+    }
+
+    /// quinn labels its BBR experimental, so a config that merely builds is not
+    /// enough evidence. This pushes real data through it end to end and checks
+    /// that every byte arrives, in order.
+    #[tokio::test]
+    async fn bbr_carries_a_real_stream_intact() {
+        const SIZE: usize = 24 * 1024 * 1024;
+
+        let listener = Endpoint::bind_all(Arc::new(Identity::generate().unwrap()), "listener", 0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+
+        let receiving = tokio::spawn(async move {
+            let session = listener.accept().await.unwrap().unwrap();
+            let (_send, mut recv) = session.accept_stream().await.unwrap();
+            let mut got = Vec::with_capacity(SIZE);
+            let mut buffer = vec![0u8; 64 * 1024];
+            while let Some(n) = recv.read(&mut buffer).await.unwrap() {
+                got.extend_from_slice(&buffer[..n]);
+            }
+            (listener, session, got)
+        });
+
+        let dialer = Endpoint::bind_all(Arc::new(Identity::generate().unwrap()), "dialer", 0).unwrap();
+        // Forced on: loopback is a LAN, so the address alone would never pick it.
+        let bbr = transport_config_for(false, RemoteCongestion::Bbr);
+        let session = dialer.connect_using(target, None, bbr).await.unwrap();
+
+        let payload: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+        let (mut send, _recv) = session.open_stream().await.unwrap();
+        send.write_all(&payload).await.unwrap();
+        send.finish().unwrap();
+
+        let (_listener, _session, got) =
+            tokio::time::timeout(std::time::Duration::from_secs(60), receiving)
+                .await
+                .expect("transfer over BBR timed out")
+                .unwrap();
+
+        assert_eq!(got.len(), SIZE, "every byte must arrive");
+        assert!(got == payload, "and arrive unaltered, in order");
+    }
+
+    #[test]
+    fn both_choices_build_a_valid_config_for_either_kind_of_peer() {
+        for lan in [true, false] {
+            for remote in [RemoteCongestion::Standard, RemoteCongestion::Bbr] {
+                let _ = transport_config_for(lan, remote);
+            }
+        }
     }
 }

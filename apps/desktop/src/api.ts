@@ -215,6 +215,8 @@ export interface SettingsView {
   folderPerDevice: boolean;
   /** Which interface to show. Classic stays the default. */
   interface: Interface;
+  /** Pacing for internet and VPN transfers. LAN transfers ignore it. */
+  remoteCongestion: "standard" | "bbr";
 }
 
 export const api = {
