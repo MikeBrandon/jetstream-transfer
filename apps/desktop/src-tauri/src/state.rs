@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use jetstream_core::identity::{Identity, store};
+use jetstream_core::rate::RateMeter;
 use jetstream_core::staging::ConflictPolicy;
 use jetstream_core::transfer::Progress;
 use jetstream_core::transport::Endpoint;
@@ -17,12 +18,11 @@ use tokio::sync::oneshot;
 
 use crate::views::{Direction, SettingsView, TransferState, TransferView};
 
-/// Samples kept for the rate estimate.
+/// How long a browser upload may go without a chunk before its row says so.
 ///
-/// Roughly two seconds at the UI's tick rate. Short enough to react when the
-/// network changes, long enough that a single slow chunk does not make the
-/// number jump around and look broken.
-const RATE_WINDOW: usize = 8;
+/// A phone gives no signal when it goes — the tab closes, the screen locks, it
+/// walks out of range — so without this its row sat at "active" for ever.
+const BROWSER_STALL: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub struct AppState {
     pub identity: Arc<Identity>,
@@ -56,6 +56,9 @@ pub struct AppState {
     /// executable's path on the host machine will break when the drive moves.
     pub portable: bool,
 
+    /// Devices the user added by address. See [`crate::manual`].
+    pub manual: crate::manual::ManualPeers,
+
     /// History records whose automatic retry is running right now.
     ///
     /// Without this, the retry watcher starts another attempt every time it
@@ -71,8 +74,9 @@ struct WebState {
     offers: Vec<PathBuf>,
     /// Text the user is sharing with browsers.
     shared_text: Option<String>,
-    /// Maps a guest label to its in-flight transfer row, so the upload's
-    /// completion can update the right one.
+    /// Maps a browser session's guest id to its in-flight transfer row, so the
+    /// upload's completion can update the right one. Keyed by session rather
+    /// than by label, which two phones of the same kind share.
     in_flight: HashMap<String, u64>,
 }
 
@@ -198,8 +202,15 @@ pub struct Transfer {
     pub summary: String,
     pub detail: Option<String>,
     pub started_at: i64,
-    /// `(instant, bytes)` samples for the rate estimate.
-    samples: Vec<(Instant, u64)>,
+    /// Smoothed speed, measured from bytes that moved in this attempt only.
+    meter: RateMeter,
+    /// What an earlier attempt of this same transfer had reached, shown until
+    /// this attempt learns the real figure from the other side.
+    ///
+    /// Without it, every resume — automatic or not — dropped the row to 0% and
+    /// "waiting…" for as long as the reconnect took, which reads exactly like
+    /// starting again from scratch.
+    carried: Option<(u64, u64)>,
     /// Frozen final counts, so a finished row keeps showing what it moved
     /// rather than reverting to whatever the atomics happen to hold.
     final_bytes: Option<(u64, u64)>,
@@ -218,18 +229,36 @@ pub struct Transfer {
     /// connection dropping, so looking it up eight times a second would be pure
     /// waste.
     link_bps: Option<u64>,
+    /// An upload from a browser, which no engine task watches over.
+    browser: bool,
+    /// When bytes last moved, and the count then — for noticing a browser that
+    /// has gone quiet.
+    last_moved: (Instant, u64),
 }
 
 impl Transfer {
-    fn view(&self, id: u64) -> TransferView {
-        let (bytes_done, bytes_total) = self.final_bytes.unwrap_or_else(|| {
-            (
-                self.progress.bytes_done.load(Ordering::Relaxed),
-                self.progress.bytes_total.load(Ordering::Relaxed),
-            )
-        });
+    /// What to show: frozen at the end, live while running, and the previous
+    /// attempt's figure until this one has a figure of its own.
+    fn bytes(&self) -> (u64, u64) {
+        if let Some(frozen) = self.final_bytes {
+            return frozen;
+        }
 
-        let rate = self.rate();
+        let live = (
+            self.progress.bytes_done.load(Ordering::Relaxed),
+            self.progress.bytes_total.load(Ordering::Relaxed),
+        );
+        match self.carried {
+            Some(carried) if live.0 == 0 && !matches!(self.state, TransferState::Active) => carried,
+            _ => live,
+        }
+    }
+
+    fn view(&self, id: u64) -> TransferView {
+        let (bytes_done, bytes_total) = self.bytes();
+
+        let running = !self.state.is_finished();
+        let rate = if running { self.meter.rate() } else { 0 };
         let remaining = bytes_total.saturating_sub(bytes_done);
 
         TransferView {
@@ -254,48 +283,61 @@ impl Transfer {
                 .map(jetstream_discovery::linkspeed::describe),
             // Only offer an estimate once the rate has settled. An ETA that
             // swings between "2 seconds" and "4 hours" is worse than none.
-            eta: (rate > 0 && !self.state.is_finished() && self.samples.len() >= 3)
-                .then(|| remaining / rate.max(1)),
+            eta: if running { self.meter.eta(remaining) } else { None },
             summary: self.summary.clone(),
             detail: self.detail.clone(),
             started_at: self.started_at,
-            resumable: self.state.is_resumable(),
+            // Only the sender holds the data, so only it can pick a transfer up
+            // again. A receive continues when the sender comes back.
+            resumable: self.direction == Direction::Sending && self.state.is_resumable(),
         }
-    }
-
-    /// Bytes per second over the recent window.
-    fn rate(&self) -> u64 {
-        let (Some(oldest), Some(newest)) = (self.samples.first(), self.samples.last()) else {
-            return 0;
-        };
-
-        let seconds = newest.0.duration_since(oldest.0).as_secs_f64();
-        if seconds < 0.25 {
-            return 0;
-        }
-        let moved = newest.1.saturating_sub(oldest.1);
-        (moved as f64 / seconds) as u64
     }
 
     fn sample(&mut self) {
+        let now = Instant::now();
+        let done = self.progress.bytes_done.load(Ordering::Relaxed);
+        let moved = self.progress.bytes_moved.load(Ordering::Relaxed);
+        let fresh = moved > self.last_moved.1;
+        if fresh {
+            self.last_moved = (now, moved);
+        }
+
+        // A browser upload has no connection to lose, only silence. Say so when
+        // it goes quiet, and pick back up when the page starts sending again.
+        if self.browser {
+            match self.state {
+                TransferState::Interrupted if fresh => {
+                    self.state = TransferState::Active;
+                    self.detail = None;
+                }
+                TransferState::Active if now.duration_since(self.last_moved.0) > BROWSER_STALL => {
+                    self.state = TransferState::Interrupted;
+                    self.detail = Some(format!(
+                        "{} stopped sending. What arrived is kept, and it carries on if the page reconnects.",
+                        self.peer_name
+                    ));
+                    self.meter.reset();
+                }
+                _ => {}
+            }
+        }
+
         if self.state.is_finished() {
             return;
         }
 
-        let done = self.progress.bytes_done.load(Ordering::Relaxed);
-
-        // Promote to Active the moment bytes actually move. The engine has no
-        // "the peer accepted" callback — data arriving *is* the signal — and
-        // inferring it here keeps the rule in one place rather than having the
-        // UI second-guess a stale `Waiting` label.
-        if done > 0 && matches!(self.state, TransferState::Connecting | TransferState::Waiting) {
+        // Promote to Active the moment the transfer is under way. The engine has
+        // no "the peer accepted" callback — a known total plus any progress,
+        // including a resume baseline, *is* the signal — and inferring it here
+        // keeps the rule in one place rather than having the UI second-guess a
+        // stale `Waiting` label.
+        if (done > 0 || moved > 0)
+            && matches!(self.state, TransferState::Connecting | TransferState::Waiting)
+        {
             self.state = TransferState::Active;
         }
 
-        self.samples.push((Instant::now(), done));
-        if self.samples.len() > RATE_WINDOW {
-            self.samples.remove(0);
-        }
+        self.meter.update(now, moved);
     }
 }
 
@@ -335,6 +377,7 @@ impl AppState {
 
         let port = endpoint.local_addr().map(|a| a.port()).unwrap_or(DEFAULT_PORT);
         let discovery = Discovery::start(identity.device_id(), &settings.device_name, port);
+        let history = crate::history::History::load(&data_dir_for_history);
 
         Ok(Arc::new(Self {
             identity,
@@ -345,11 +388,12 @@ impl AppState {
             data_dir,
             transfers: Mutex::new(HashMap::new()),
             pending_offers: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(history.next_id()),
             web: Mutex::new(WebState::default()),
             web_server: tokio::sync::Mutex::new(None),
-            history: crate::history::History::load(&data_dir_for_history),
+            history,
             first_hide_done: std::sync::atomic::AtomicBool::new(false),
+            manual: crate::manual::ManualPeers::load(&data_dir_for_history),
             portable,
             retrying: Mutex::new(HashSet::new()),
         }))
@@ -394,7 +438,16 @@ impl AppState {
         summary: String,
         progress: Arc<Progress>,
     ) {
-        self.transfers.lock().expect("transfers poisoned").insert(
+        let mut transfers = self.transfers.lock().expect("transfers poisoned");
+
+        // The same id means another attempt at the same transfer: keep showing
+        // how far it had got, and where its files are.
+        let previous = transfers.get(&id);
+        let carried = previous.map(Transfer::bytes).filter(|(done, _)| *done > 0);
+        let reveal = previous.and_then(|transfer| transfer.reveal.clone());
+        let started_at = previous.map_or_else(unix_now, |transfer| transfer.started_at);
+
+        transfers.insert(
             id,
             Transfer {
                 direction,
@@ -404,14 +457,49 @@ impl AppState {
                 progress,
                 summary,
                 detail: None,
-                started_at: unix_now(),
-                samples: Vec::new(),
+                started_at,
+                meter: RateMeter::new(),
+                carried,
                 final_bytes: None,
                 skipped: Vec::new(),
-                reveal: None,
+                reveal,
                 link_bps: None,
+                browser: false,
+                last_moved: (Instant::now(), 0),
             },
         );
+    }
+
+    /// Mark a row as a browser upload. See [`Transfer::browser`].
+    pub fn mark_browser(&self, id: u64) {
+        let mut transfers = self.transfers.lock().expect("transfers poisoned");
+        if let Some(transfer) = transfers.get_mut(&id) {
+            transfer.browser = true;
+        }
+    }
+
+    /// Show `bytes` as where this transfer had got to, until it reports its own
+    /// figure. For a resume after a restart, when there is no previous row in
+    /// memory to carry over from — only what history recorded.
+    pub fn carry(&self, id: u64, bytes: (u64, u64)) {
+        if bytes.0 == 0 {
+            return;
+        }
+        let mut transfers = self.transfers.lock().expect("transfers poisoned");
+        if let Some(transfer) = transfers.get_mut(&id)
+            && transfer.carried.is_none()
+        {
+            transfer.carried = Some(bytes);
+        }
+    }
+
+    /// How far a transfer had got, as shown — for recording in history.
+    pub fn shown_bytes(&self, id: u64) -> Option<(u64, u64)> {
+        self.transfers
+            .lock()
+            .expect("transfers poisoned")
+            .get(&id)
+            .map(Transfer::bytes)
     }
 
     /// Remember where to point Explorer for this transfer.
@@ -458,19 +546,30 @@ impl AppState {
             if detail.is_some() {
                 transfer.detail = detail;
             }
+            // Quiet time counts from when it started moving, not from when the
+            // row appeared — an accept prompt can sit open for minutes.
+            if state == TransferState::Active {
+                transfer.last_moved.0 = Instant::now();
+            }
             if state.is_finished() {
-                transfer.final_bytes = Some((
-                    transfer.progress.bytes_done.load(Ordering::Relaxed),
-                    transfer.progress.bytes_total.load(Ordering::Relaxed),
-                ));
+                transfer.final_bytes = Some(transfer.bytes());
             }
         }
     }
 
     pub fn cancel_transfer(&self, id: u64) {
-        let transfers = self.transfers.lock().expect("transfers poisoned");
-        if let Some(transfer) = transfers.get(&id) {
+        let mut transfers = self.transfers.lock().expect("transfers poisoned");
+        if let Some(transfer) = transfers.get_mut(&id) {
             transfer.progress.cancel.store(true, Ordering::Relaxed);
+
+            // No engine task watches a browser upload, so nothing else would
+            // move the row on. The flag makes the server refuse the phone's
+            // next chunk, which tells the page.
+            if transfer.browser && !transfer.state.is_finished() {
+                transfer.state = TransferState::Cancelled;
+                transfer.detail = Some("Stopped. Files that had finished were kept.".into());
+                transfer.final_bytes = Some(transfer.bytes());
+            }
         }
     }
 
@@ -567,12 +666,12 @@ impl AppState {
         self.web.lock().expect("web poisoned").shared_text.clone()
     }
 
-    pub fn remember_web_transfer(&self, label: String, id: u64) {
-        self.web.lock().expect("web poisoned").in_flight.insert(label, id);
+    pub fn remember_web_transfer(&self, guest_id: String, id: u64) {
+        self.web.lock().expect("web poisoned").in_flight.insert(guest_id, id);
     }
 
-    pub fn take_web_transfer(&self, label: &str) -> Option<u64> {
-        self.web.lock().expect("web poisoned").in_flight.remove(label)
+    pub fn take_web_transfer(&self, guest_id: &str) -> Option<u64> {
+        self.web.lock().expect("web poisoned").in_flight.remove(guest_id)
     }
 
     pub fn forget_offer(&self, id: u64) {

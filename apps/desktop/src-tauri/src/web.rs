@@ -95,10 +95,12 @@ impl WebHandler for DesktopWebHandler {
                 total_bytes: offer.total_bytes,
                 top_level: offer.top_level,
                 more_top_level: false,
+                browser: true,
             };
 
             let answer = state.register_offer(id);
             let _ = app.emit("offer", &view);
+            crate::tray::ask_for_attention(&app);
 
             let accepted = match tokio::time::timeout(OFFER_TIMEOUT, answer).await {
                 Ok(Ok(answer)) => answer.accept,
@@ -117,7 +119,8 @@ impl WebHandler for DesktopWebHandler {
             }
 
             state.set_state(id, TransferState::Active, None);
-            state.remember_web_transfer(guest.label.clone(), id);
+            state.mark_browser(id);
+            state.remember_web_transfer(guest.id.clone(), id);
             let _ = app.emit("transfers", state.transfer_views());
 
             Some(UploadGrant {
@@ -129,7 +132,7 @@ impl WebHandler for DesktopWebHandler {
     }
 
     fn upload_finished(&self, guest: GuestInfo, files: Vec<String>) {
-        if let Some(id) = self.state.take_web_transfer(&guest.label) {
+        if let Some(id) = self.state.take_web_transfer(&guest.id) {
             self.state.set_state(
                 id,
                 TransferState::Done,

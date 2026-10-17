@@ -40,11 +40,25 @@ struct Announce {
     port: u16,
 }
 
+fn encode_announce(device_id: DeviceId, name: &str, port: u16) -> std::io::Result<Vec<u8>> {
+    postcard::to_stdvec(&Announce {
+        magic: MAGIC,
+        version: ANNOUNCE_VERSION,
+        device_id,
+        name: sanitize_name(name),
+        port,
+    })
+    .map_err(std::io::Error::other)
+}
+
 /// Broadcast announcer and listener.
 pub struct Broadcaster {
     socket: Arc<UdpSocket>,
-    announce: Vec<u8>,
+    /// The encoded announcement. Behind a lock so a rename takes effect on the
+    /// next round rather than at the next launch.
+    announce: std::sync::RwLock<Vec<u8>>,
     device_id: DeviceId,
+    transfer_port: u16,
 }
 
 impl Broadcaster {
@@ -64,20 +78,22 @@ impl Broadcaster {
 
         let socket = Arc::new(UdpSocket::from_std(socket.into())?);
 
-        let announce = postcard::to_stdvec(&Announce {
-            magic: MAGIC,
-            version: ANNOUNCE_VERSION,
-            device_id,
-            name: sanitize_name(name),
-            port: transfer_port,
-        })
-        .map_err(std::io::Error::other)?;
+        let announce = encode_announce(device_id, name, transfer_port)?;
 
         Ok(Self {
             socket,
-            announce,
+            announce: std::sync::RwLock::new(announce),
             device_id,
+            transfer_port,
         })
+    }
+
+    /// Announce a new display name from the next round on.
+    pub fn rename(&self, name: &str) {
+        match encode_announce(self.device_id, name, self.transfer_port) {
+            Ok(encoded) => *self.announce.write().expect("announce poisoned") = encoded,
+            Err(e) => tracing::warn!(error = %e, "could not encode the renamed announcement"),
+        }
     }
 
     /// Announce ourselves periodically until the task is dropped.
@@ -111,6 +127,7 @@ impl Broadcaster {
     /// adapter changing address is picked up automatically with no invalidation
     /// logic to get wrong.
     async fn announce_once(&self) {
+        let announcement = self.announce.read().expect("announce poisoned").clone();
         let mut delivered = 0usize;
         let mut failures = Vec::new();
 
@@ -128,7 +145,7 @@ impl Broadcaster {
             // reject the other.
             for target in [source.broadcast, Ipv4Addr::BROADCAST] {
                 match socket
-                    .send_to(&self.announce, SocketAddrV4::new(target, DISCOVERY_PORT))
+                    .send_to(&announcement, SocketAddrV4::new(target, DISCOVERY_PORT))
                     .await
                 {
                     Ok(_) => {
@@ -302,15 +319,16 @@ mod tests {
     /// A `Broadcaster` without a socket, for exercising `parse` alone.
     fn parser(device_id: DeviceId) -> Broadcaster {
         // `bind` needs a real socket; construct the fields directly instead.
+        // Non-blocking before tokio sees it: current tokio refuses to register
+        // a blocking socket, and these tests failed on exactly that.
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+
         Broadcaster {
-            socket: Arc::new(
-                UdpSocket::from_std(
-                    std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
-                )
-                .unwrap(),
-            ),
-            announce: Vec::new(),
+            socket: Arc::new(UdpSocket::from_std(socket).unwrap()),
+            announce: std::sync::RwLock::new(Vec::new()),
             device_id,
+            transfer_port: 0,
         }
     }
 

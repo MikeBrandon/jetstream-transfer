@@ -65,6 +65,22 @@ pub enum Error {
     #[error("paused")]
     Paused,
 
+    /// The other device paused the transfer and expects to continue it.
+    #[error("the other device paused the transfer")]
+    PausedByPeer,
+
+    /// The other device cancelled the transfer.
+    #[error("the other device cancelled the transfer")]
+    CancelledByPeer,
+
+    /// The other device gave up because something went wrong on its side.
+    ///
+    /// Used to arrive as [`Error::Rejected`], so a receiver running out of disk
+    /// space mid-transfer showed up on the sender as "declined" — a word that
+    /// means a person said no, and one that stopped the transfer being resumed.
+    #[error("the other device stopped: {0}")]
+    PeerFailed(String),
+
     #[error("unsupported protocol version: peer speaks {peer}, we speak {ours}")]
     VersionMismatch { peer: u16, ours: u16 },
 }

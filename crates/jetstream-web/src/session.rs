@@ -17,9 +17,10 @@
 //! - Comparison is constant-time, so timing cannot be used to recover a code
 //!   byte by byte.
 //!
-//! Session cookies are `HttpOnly` and `SameSite=Strict`. They cannot be
-//! `Secure`, because the connection is plain HTTP and a `Secure` cookie would
-//! simply never be sent — marking it so would be theatre.
+//! Session cookies are `HttpOnly` and `SameSite=Lax` — see [`crate::routes`]
+//! for why not `Strict`. They cannot be `Secure`, because the connection is
+//! plain HTTP and a `Secure` cookie would simply never be sent — marking it so
+//! would be theatre.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -47,6 +48,9 @@ pub struct GuestInfo {
     /// a browser can claim anything, so this is never a security input.
     pub label: String,
     pub address: String,
+    /// Tells one browser session from another — two iPhones share a label.
+    /// Assigned when the session starts. Not the cookie, and not secret.
+    pub id: String,
 }
 
 struct Code {
@@ -90,8 +94,19 @@ impl Sessions {
         }
     }
 
+    /// Whether `token` is a live code, **without** spending it.
+    ///
+    /// For the page a scanned link first opens. Link previews and QR apps fetch
+    /// a URL before the browser does, and when that first fetch redeemed the
+    /// code, the person's own browser then found it already used.
+    pub fn is_live(&self, token: &str) -> bool {
+        let mut codes = self.codes.lock().expect("codes poisoned");
+        codes.retain(|code| code.issued.elapsed() < CODE_LIFETIME);
+        codes.iter().any(|code| constant_time_eq(&code.token, token))
+    }
+
     /// Exchange a code for a session id, consuming the code.
-    pub fn redeem(&self, token: &str, guest: GuestInfo) -> Option<String> {
+    pub fn redeem(&self, token: &str, mut guest: GuestInfo) -> Option<String> {
         let mut codes = self.codes.lock().expect("codes poisoned");
         codes.retain(|code| code.issued.elapsed() < CODE_LIFETIME);
 
@@ -101,6 +116,7 @@ impl Sessions {
         codes.remove(position);
         drop(codes);
 
+        guest.id = random_token()[..8].to_string();
         let id = random_token();
         self.sessions.lock().expect("sessions poisoned").insert(
             id.clone(),
@@ -189,7 +205,33 @@ mod tests {
         GuestInfo {
             label: "iPhone".into(),
             address: "192.168.1.20".into(),
+            id: String::new(),
         }
+    }
+
+    #[test]
+    fn looking_at_a_code_does_not_spend_it() {
+        let sessions = Sessions::new();
+        let code = sessions.issue_code("http://192.168.1.6:5000");
+
+        // A link preview, then the person's browser.
+        assert!(sessions.is_live(&code.token));
+        assert!(sessions.is_live(&code.token));
+        assert!(sessions.redeem(&code.token, guest()).is_some());
+        assert!(!sessions.is_live(&code.token), "but redeeming it does");
+    }
+
+    #[test]
+    fn each_session_gets_its_own_guest_id() {
+        let sessions = Sessions::new();
+        let first = sessions.issue_code("http://x");
+        let second = sessions.issue_code("http://x");
+
+        let a = sessions.redeem(&first.token, guest()).unwrap();
+        let b = sessions.redeem(&second.token, guest()).unwrap();
+        let (a, b) = (sessions.lookup(&a).unwrap(), sessions.lookup(&b).unwrap());
+        assert_eq!(a.label, b.label);
+        assert_ne!(a.id, b.id, "two phones of the same kind must not share an id");
     }
 
     #[test]

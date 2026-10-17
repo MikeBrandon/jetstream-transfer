@@ -36,12 +36,25 @@ const FILE: &str = "history.json";
 /// trivial to read and rewrite.
 const MAX_RECORDS: usize = 500;
 
-/// How many times an interrupted transfer is retried automatically.
+/// How many automatic retries in a row may fail to move anything.
 ///
 /// Bounded so a transfer that fails for a reason retrying cannot fix — the
 /// source file was deleted, the peer keeps declining — does not retry forever.
 /// After this the record stays, and the user can retry by hand.
+///
+/// Counted per *unproductive* attempt: an attempt that moved data resets it. A
+/// long copy over a flaky link — a VPN that drops every half hour — used to
+/// exhaust a lifetime cap of five and then silently stop resuming, even though
+/// every attempt had been getting somewhere.
 pub const MAX_ATTEMPTS: u32 = 5;
+
+/// How long a receive the user accepted may be continued without asking again.
+///
+/// Within this, the same device offering exactly the same files (the same
+/// manifest digest) is the transfer they already said yes to, picking up where
+/// it stopped. Beyond it, they are asked again — a yes from months ago is not
+/// one they will remember giving.
+pub const RESUME_WITHOUT_ASKING: i64 = 30 * 24 * 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +113,21 @@ pub struct Record {
     pub attempts: u32,
     #[serde(default)]
     pub detail: Option<String>,
+    /// The manifest digest, hex. What makes a later offer recognisably the same
+    /// transfer rather than a new one.
+    #[serde(default)]
+    pub digest: Option<String>,
+    /// For a receive, where its files — and its staged partial data — live.
+    ///
+    /// Remembered because the download folder setting can change between
+    /// attempts, and resuming into the new folder would start over: the staged
+    /// chunks are in the old one.
+    #[serde(default)]
+    pub destination: Option<PathBuf>,
+    /// How much had arrived when the attempt ended, so the list can say how far
+    /// an unfinished transfer got.
+    #[serde(default)]
+    pub transferred: u64,
 }
 
 impl Record {
@@ -116,6 +144,14 @@ impl Record {
 
     pub fn device(&self) -> Option<DeviceId> {
         self.peer_device_id.parse().ok()
+    }
+
+    /// Whether a receive can carry on without asking the user again: they
+    /// accepted it, nobody decided to stop it here, and not too long ago.
+    pub fn continues_without_asking(&self, now: i64) -> bool {
+        !self.sending
+            && matches!(self.outcome, Outcome::Interrupted | Outcome::Paused)
+            && now.saturating_sub(self.at) < RESUME_WITHOUT_ASKING
     }
 }
 
@@ -175,6 +211,50 @@ impl History {
         self.write(&records);
     }
 
+    /// The id to give the next transfer: one past any already recorded.
+    ///
+    /// Transfer ids are history ids, so they must not restart at 1 on every
+    /// launch. When they did, the first transfer after a restart took over an
+    /// old record — replacing it, inheriting its retry count — and an automatic
+    /// resume could replace an unrelated row in the transfer list.
+    pub fn next_id(&self) -> u64 {
+        self.records
+            .lock()
+            .expect("history poisoned")
+            .iter()
+            .map(|record| record.id)
+            .max()
+            .map_or(1, |max| max + 1)
+    }
+
+    /// An earlier receive of exactly this content from this device that has not
+    /// finished — the transfer a new offer is continuing.
+    pub fn unfinished_receive(&self, peer_device_id: &str, digest: &str) -> Option<Record> {
+        self.records
+            .lock()
+            .expect("history poisoned")
+            .iter()
+            .find(|record| {
+                !record.sending
+                    && record.peer_device_id == peer_device_id
+                    && record.digest.as_deref() == Some(digest)
+                    && !matches!(record.outcome, Outcome::Completed | Outcome::Declined)
+            })
+            .cloned()
+    }
+
+    /// Note that an attempt moved data, so the unproductive-attempt count starts
+    /// again. See [`MAX_ATTEMPTS`].
+    pub fn note_progress(&self, id: u64) {
+        let mut records = self.records.lock().expect("history poisoned");
+        if let Some(record) = records.iter_mut().find(|r| r.id == id)
+            && record.attempts != 0
+        {
+            record.attempts = 0;
+            self.write(&records);
+        }
+    }
+
     /// Note that a retry was attempted, so the count cannot run away.
     pub fn note_attempt(&self, id: u64) {
         let mut records = self.records.lock().expect("history poisoned");
@@ -192,6 +272,15 @@ impl History {
             record.detail = detail;
         }
         self.write(&records);
+    }
+
+    pub fn get(&self, id: u64) -> Option<Record> {
+        self.records
+            .lock()
+            .expect("history poisoned")
+            .iter()
+            .find(|record| record.id == id)
+            .cloned()
     }
 
     pub fn all(&self) -> Vec<Record> {
@@ -272,7 +361,81 @@ mod tests {
             at: 1_700_000_000 + id as i64,
             attempts: 0,
             detail: None,
+            digest: None,
+            destination: None,
+            transferred: 0,
         }
+    }
+
+    #[test]
+    fn ids_continue_past_what_is_already_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let history = History::load(dir.path());
+            assert_eq!(history.next_id(), 1);
+            history.record(record(7, true, Outcome::Interrupted));
+            history.record(record(3, true, Outcome::Completed));
+        }
+
+        // A restart must not hand out 1 again and overwrite record 3 or 7.
+        assert_eq!(History::load(dir.path()).next_id(), 8);
+    }
+
+    #[test]
+    fn an_attempt_that_moved_data_resets_the_retry_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::load(dir.path());
+        history.record(record(1, true, Outcome::Interrupted));
+
+        // Far more interruptions than the cap, each one getting somewhere.
+        for _ in 0..(MAX_ATTEMPTS * 3) {
+            history.note_attempt(1);
+            history.note_progress(1);
+        }
+        assert!(
+            history.all()[0].wants_retry(),
+            "a transfer that keeps making progress must keep resuming"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_receive_is_found_by_peer_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::load(dir.path());
+
+        let mut receive = record(1, false, Outcome::Interrupted);
+        receive.digest = Some("abc".into());
+        history.record(receive.clone());
+
+        let peer = receive.peer_device_id.clone();
+        assert_eq!(history.unfinished_receive(&peer, "abc").map(|r| r.id), Some(1));
+        assert!(history.unfinished_receive(&peer, "other").is_none());
+        assert!(history.unfinished_receive("someone-else", "abc").is_none());
+
+        receive.outcome = Outcome::Completed;
+        history.record(receive);
+        assert!(
+            history.unfinished_receive(&peer, "abc").is_none(),
+            "sending the same files again after they arrived is a new transfer"
+        );
+    }
+
+    #[test]
+    fn only_a_recent_interruption_continues_without_asking() {
+        let now = 1_800_000_000;
+        let mut receive = record(1, false, Outcome::Interrupted);
+        receive.at = now - 60;
+        assert!(receive.continues_without_asking(now));
+
+        receive.at = now - RESUME_WITHOUT_ASKING - 1;
+        assert!(!receive.continues_without_asking(now), "too old to assume the answer");
+
+        receive.at = now - 60;
+        receive.outcome = Outcome::Cancelled;
+        assert!(
+            !receive.continues_without_asking(now),
+            "the user stopped this one, so they decide again"
+        );
     }
 
     #[test]

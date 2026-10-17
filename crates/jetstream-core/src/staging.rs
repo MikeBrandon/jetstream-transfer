@@ -394,7 +394,12 @@ impl Staging {
                 // A skipped file counts as fully here — it is, just not because
                 // we put it there. Without this a Skip run would report 0%
                 // throughout while correctly transferring nothing.
-                if self.skipped.contains(i as u32) {
+                //
+                // Likewise a file already delivered by an earlier attempt. Its
+                // bitmap is deleted once it is placed, so the map alone says
+                // nothing is here — and a resumed transfer started from far below
+                // where it really was, then finished well short of 100%.
+                if self.skipped.contains(i as u32) || self.placed.contains(i as u32) {
                     return entry.size();
                 }
                 self.maps
@@ -419,7 +424,7 @@ impl Staging {
                 if !entry.is_file() {
                     return false;
                 }
-                if self.skipped.contains(*i as u32) {
+                if self.skipped.contains(*i as u32) || self.placed.contains(*i as u32) {
                     return true;
                 }
                 let size = entry.size();
@@ -550,6 +555,27 @@ impl Staging {
         let encoded = encode_map(&self.maps[index as usize]);
         write_durably(&self.map_path(index), &encoded)?;
         self.pending[index as usize] = 0;
+        Ok(())
+    }
+
+    /// Checkpoint every file with chunks written since its last checkpoint.
+    ///
+    /// For a receive that stops early. Periodic checkpoints only happen every
+    /// [`CHECKPOINT_INTERVAL`] chunks, so without this an interruption threw away
+    /// up to 64 MiB per file — for any file smaller than that, everything it had
+    /// received — and the resume fetched it all again.
+    pub fn checkpoint_all(&mut self) -> Result<()> {
+        let dirty: Vec<u32> = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| **pending > 0)
+            .map(|(index, _)| index as u32)
+            .collect();
+
+        for index in dirty {
+            self.checkpoint(index)?;
+        }
         Ok(())
     }
 
@@ -805,6 +831,12 @@ impl Staging {
             if self.handle_order.len() >= HANDLE_CACHE
                 && let Some(evict) = self.handle_order.first().copied()
             {
+                // Record what this file has before letting go of its handle. The
+                // checkpoint's flush needs the handle, and a bitmap written later
+                // without one could claim data that never reached the disk.
+                if let Err(e) = self.checkpoint(evict) {
+                    tracing::debug!(index = evict, error = %e, "could not checkpoint before closing a file");
+                }
                 self.close_handle(evict);
             }
 
@@ -1034,6 +1066,67 @@ mod tests {
                 .write_chunk(index, chunk_index, slice, hash.as_bytes())
                 .unwrap();
         }
+    }
+
+    /// Regression: a file delivered by an earlier attempt counted as nothing on
+    /// resume, because its bitmap is deleted once it is placed. A resumed
+    /// transfer then showed far less progress than it had made, told the sender
+    /// the same, and finished short of 100%.
+    #[test]
+    fn files_delivered_before_an_interruption_count_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = payload(9 * 1024 * 1024, 3);
+        let small = payload(5000, 4);
+        let manifest = Manifest {
+            entries: vec![
+                entry("big.bin", big.len() as u64),
+                entry("small.bin", small.len() as u64),
+            ],
+        };
+
+        {
+            let mut staging =
+                Staging::open(dir.path(), manifest.clone(), ConflictPolicy::Rename).unwrap();
+            send_all(&mut staging, 0, &big);
+            staging.finish_file(0, blake3::hash(&big).as_bytes()).unwrap();
+        }
+
+        let resumed = Staging::open(dir.path(), manifest, ConflictPolicy::Rename).unwrap();
+        assert!(resumed.is_placed(0));
+        assert_eq!(resumed.bytes_present(), big.len() as u64);
+        assert_eq!(resumed.files_present(), 1);
+        assert!(
+            resumed.outstanding().iter().all(|(index, _)| *index != 0),
+            "a delivered file must not be requested again"
+        );
+    }
+
+    #[test]
+    fn stopping_early_keeps_every_chunk_that_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        // Ten chunks: well under the periodic checkpoint interval, so before
+        // `checkpoint_all` none of this survived an interruption.
+        let data = payload(10 * chunk::CHUNK_SIZE as usize, 5);
+        let manifest = Manifest {
+            entries: vec![entry("medium.bin", data.len() as u64)],
+        };
+
+        {
+            let mut staging =
+                Staging::open(dir.path(), manifest.clone(), ConflictPolicy::Rename).unwrap();
+            for chunk_index in 0..6u32 {
+                let (offset, len) = chunk::chunk_span(chunk_index, data.len() as u64).unwrap();
+                let slice = &data[offset as usize..offset as usize + len];
+                staging
+                    .write_chunk(0, chunk_index, slice, blake3::hash(slice).as_bytes())
+                    .unwrap();
+            }
+            staging.checkpoint_all().unwrap();
+        }
+
+        let resumed = Staging::open(dir.path(), manifest, ConflictPolicy::Rename).unwrap();
+        assert_eq!(resumed.bytes_present(), 6 * chunk::CHUNK_SIZE);
+        assert_eq!(resumed.outstanding(), vec![(0, ChunkRange::new(6, 10))]);
     }
 
     #[test]

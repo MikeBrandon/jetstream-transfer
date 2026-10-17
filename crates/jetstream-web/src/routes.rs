@@ -31,7 +31,7 @@ const MAX_TEXT: usize = 64 * 1024;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/j/{token}", get(redeem))
+        .route("/j/{token}", get(arrive).post(redeem))
         .route("/", get(page))
         .route("/api/session", get(session_info))
         .route("/api/upload", post(begin_upload))
@@ -42,6 +42,30 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/text", post(post_text).get(get_text))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
+}
+
+/// What a scanned code opens: a page that redeems it, without redeeming it.
+///
+/// Spending the code on a plain GET meant anything that fetched the link first
+/// spent it — a QR scanner app showing a preview, a messenger unfurling it —
+/// and the person's own browser then got "already used". This page spends it
+/// with a POST from script, which link previews do not run. Browsers with
+/// script switched off get a button that does the same.
+async fn arrive(State(state): State<Arc<AppState>>, Path(token): Path<String>) -> Response {
+    if !state.sessions.is_live(&token) {
+        return (StatusCode::FORBIDDEN, Html(expired_page())).into_response();
+    }
+
+    (
+        [
+            // Never kept: a cached copy would POST a spent code.
+            (header::CACHE_CONTROL, "no-store"),
+            // The code is in this page's URL; keep it out of anything it links to.
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        Html(arrival_page(&token)),
+    )
+        .into_response()
 }
 
 /// Exchange a pairing token for a session cookie.
@@ -57,23 +81,33 @@ async fn redeem(
     let guest = GuestInfo {
         label: label_from_user_agent(user_agent(&headers)),
         address: String::new(),
+        id: String::new(),
     };
 
     match state.sessions.redeem(&token, guest) {
         Some(id) => {
             tracing::info!("a browser paired with the receiver");
 
-            // `SameSite=Strict` so another site cannot make a browser act on
-            // this session. Not `Secure`: the connection is plain HTTP, and a
-            // Secure cookie would simply never be sent.
+            // `SameSite=Lax`, not `Strict`. Strict cookies are withheld on a
+            // navigation that starts outside the site, and some phone browsers
+            // count a link opened from the camera or a QR app as exactly that —
+            // so the redirect below arrived without the cookie it had just set,
+            // and the page said the link had expired. Lax still keeps the cookie
+            // off every cross-site request that could change anything: the API
+            // is all POST and PUT from this page's own script. Not `Secure`: the
+            // connection is plain HTTP, and a Secure cookie would never be sent.
             let cookie = format!(
-                "{COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+                "{COOKIE}={id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
                 crate::SESSION_LIFETIME.as_secs()
             );
 
             (
                 StatusCode::SEE_OTHER,
-                [(header::SET_COOKIE, cookie), (header::LOCATION, "/".into())],
+                [
+                    (header::SET_COOKIE, cookie),
+                    (header::LOCATION, "/".into()),
+                    (header::CACHE_CONTROL, "no-store".into()),
+                ],
             )
                 .into_response()
         }
@@ -320,6 +354,7 @@ fn upload_error(error: UploadError) -> Response {
         UploadError::Unknown => StatusCode::NOT_FOUND,
         UploadError::BadChecksum => StatusCode::UNPROCESSABLE_ENTITY,
         UploadError::Invalid(_) => StatusCode::BAD_REQUEST,
+        UploadError::Stopped => StatusCode::GONE,
     };
     (status, error.to_string()).into_response()
 }
@@ -362,6 +397,24 @@ fn urlencode(text: &str) -> String {
         }
     }
     out
+}
+
+/// The page a scanned code opens. Redeems the code with a POST as soon as it
+/// loads. The token is hex, so it is safe to place in the markup as is.
+fn arrival_page(token: &str) -> String {
+    debug_assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+    let token: String = token.chars().filter(char::is_ascii_hexdigit).collect();
+
+    format!(
+        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Jetstream</title>
+<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1417;color:#e8eef0;
+font-family:system-ui,sans-serif;text-align:center;padding:24px}}p{{color:#93a5ad;max-width:30ch;line-height:1.6}}
+button{{font:inherit;padding:12px 22px;border-radius:10px;border:0;background:#62b3c5;color:#0f1417;font-weight:600}}</style>
+<form method="post" action="/j/{token}"><h1 style="letter-spacing:.06em;font-size:19px">JETSTREAM</h1>
+<p>Connecting…</p><noscript><button type="submit">Continue</button></noscript></form>
+<script>document.forms[0].submit()</script>"#
+    )
 }
 
 fn expired_page() -> String {
@@ -435,6 +488,7 @@ mod tests {
                 GuestInfo {
                     label: "iPhone".into(),
                     address: String::new(),
+                    id: String::new(),
                 },
             )
             .unwrap();

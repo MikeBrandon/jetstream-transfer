@@ -15,6 +15,9 @@ interface Props {
   onClear: () => void;
 }
 
+// Every outcome the Rust side can send must have a case. A missing one returned
+// undefined, and reading `.tone` off it took the whole window down the moment a
+// paused or cancelled transfer appeared in the list.
 function outcomeChip(record: HistoryView): { text: string; tone: string } {
   switch (record.outcome) {
     case "completed":
@@ -23,11 +26,23 @@ function outcomeChip(record: HistoryView): { text: string; tone: string } {
       return record.willRetry
         ? { text: "will resume", tone: "cyan" }
         : { text: "stopped", tone: "amber" };
+    case "paused":
+      return { text: "paused", tone: "amber" };
+    case "cancelled":
+      return { text: "cancelled", tone: "" };
     case "declined":
       return { text: "declined", tone: "pink" };
     case "failed":
       return { text: "failed", tone: "pink" };
+    default:
+      return { text: String(record.outcome), tone: "" };
   }
+}
+
+function retryLabel(record: HistoryView): string {
+  if (record.willRetry) return "Try now";
+  if (record.outcome === "paused") return "Continue";
+  return "Retry";
 }
 
 export function History({ records, onRetry, onForget, onClear }: Props) {
@@ -83,6 +98,10 @@ export function History({ records, onRetry, onForget, onClear }: Props) {
               </div>
               <div className="name" style={{ fontSize: 12, color: "var(--text-dim)" }}>
                 {record.summary || formatBytes(record.bytes)}
+                {record.outcome !== "completed" &&
+                  record.transferred > 0 &&
+                  record.bytes > 0 &&
+                  ` · got to ${formatBytes(record.transferred)} of ${formatBytes(record.bytes)}`}
               </div>
               <div style={{ fontSize: 11, color: "var(--text-faint)" }}>
                 {formatWhen(record.at)}
@@ -97,7 +116,7 @@ export function History({ records, onRetry, onForget, onClear }: Props) {
 
             {record.canRetry && record.outcome !== "completed" && (
               <button className="btn small" onClick={() => onRetry(record)}>
-                {record.willRetry ? "Try now" : "Retry"}
+                {retryLabel(record)}
               </button>
             )}
             <button className="btn ghost small" onClick={() => onForget(record)}>

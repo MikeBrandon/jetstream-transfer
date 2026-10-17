@@ -51,12 +51,14 @@ pub struct PeerInfo {
 pub struct Session {
     connection: quinn::Connection,
     peer: PeerInfo,
-    control: Mutex<ControlStream>,
-}
-
-struct ControlStream {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    /// The two halves of the control stream, locked separately.
+    ///
+    /// One lock over both used to mean that a task waiting for the next message
+    /// held the stream, so nothing could be *sent* until something arrived. With
+    /// both ends listening for the whole transfer that would deadlock: each side
+    /// sits in `recv_control` while its own progress reports queue behind it.
+    control_send: Mutex<quinn::SendStream>,
+    control_recv: Mutex<quinn::RecvStream>,
 }
 
 impl Session {
@@ -79,7 +81,7 @@ impl Session {
         };
 
         proto::write_frame(&mut send, &local).await?;
-        let remote: Hello = proto::read_frame(&mut recv, MAX_CONTROL_FRAME).await?;
+        let remote = Hello::decode(&proto::read_frame_bytes(&mut recv, MAX_CONTROL_FRAME).await?)?;
 
         // A peer may claim any id it likes in `Hello`. Only the TLS key proves
         // anything, so a disagreement means either a buggy peer or an attempt
@@ -122,7 +124,8 @@ impl Session {
         Ok(Arc::new(Self {
             connection,
             peer,
-            control: Mutex::new(ControlStream { send, recv }),
+            control_send: Mutex::new(send),
+            control_recv: Mutex::new(recv),
         }))
     }
 
@@ -148,14 +151,28 @@ impl Session {
 
     /// Send a control message.
     pub async fn send_control(&self, message: &Control) -> Result<()> {
-        let mut control = self.control.lock().await;
-        proto::write_frame(&mut control.send, message).await
+        let mut send = self.control_send.lock().await;
+        proto::write_frame(&mut *send, message).await
     }
 
     /// Await the next control message.
     pub async fn recv_control(&self) -> Result<Control> {
-        let mut control = self.control.lock().await;
-        proto::read_frame(&mut control.recv, MAX_CONTROL_FRAME).await
+        let mut recv = self.control_recv.lock().await;
+        proto::read_frame(&mut *recv, MAX_CONTROL_FRAME).await
+    }
+
+    /// Resolves once the connection has closed, for whatever reason.
+    ///
+    /// Lets something waiting on a person — an accept prompt — notice that the
+    /// other device gave up, instead of asking a question nobody is waiting for.
+    pub async fn closed(&self) {
+        let _ = self.connection.closed().await;
+    }
+
+    /// Whether the peer understands the live-status messages. See
+    /// [`proto::Capabilities::live_status`].
+    pub fn peer_has_live_status(&self) -> bool {
+        self.peer.capabilities.live_status
     }
 
     /// Application-level liveness probe. Returns the measured round trip.

@@ -30,7 +30,7 @@ use crate::chunk::{self, CHUNK_SIZE, ChunkRange};
 use crate::error::{Error, Result};
 use crate::manifest::{ENTRIES_PER_BATCH, Manifest, Summary};
 use crate::path::to_extended_length;
-use crate::proto::{self, ChunkHeader, Control, DataRequest, MAX_CONTROL_FRAME, Offer};
+use crate::proto::{self, ChunkHeader, Control, DataRequest, MAX_CONTROL_FRAME, Offer, StopReason};
 use crate::staging::{ConflictPolicy, Placement, Staging};
 use crate::transport::Session;
 
@@ -42,6 +42,14 @@ pub struct Progress {
     pub bytes_done: AtomicU64,
     pub files_total: AtomicU64,
     pub files_done: AtomicU64,
+    /// Bytes that actually crossed the wire during this attempt.
+    ///
+    /// `bytes_done` is what the progress bar shows, and on a resume it starts
+    /// at everything already there. That is the right thing to *display* and the
+    /// wrong thing to measure speed from: the jump from zero to the baseline read
+    /// as tens of gigabytes a second. Rates come from this counter instead, which
+    /// only ever grows by bytes that moved.
+    pub bytes_moved: AtomicU64,
     /// Set to ask the transfer to stop at the next chunk boundary. Staged data
     /// is kept, so a cancelled transfer can be resumed rather than restarted.
     pub cancel: AtomicBool,
@@ -67,6 +75,10 @@ pub struct Progress {
     /// default, and unlimited means one uncontended lock per chunk — around a
     /// hundred a second at full speed, which is nothing.
     pub limit: crate::throttle::Throttle,
+    /// Set when the *other* device stopped on purpose, so the workers here stop
+    /// at their next chunk boundary rather than draining whatever QUIC had
+    /// already buffered. 0 = carry on, otherwise a [`StopReason`] code.
+    peer_stop: std::sync::atomic::AtomicU8,
 }
 
 impl Progress {
@@ -97,7 +109,12 @@ impl Progress {
     /// Bytes actually sent are still the right thing to *measure* — that is what
     /// the rate is derived from — so the raw addition happens and only the
     /// reported total is bounded.
-    fn advance(&self, bytes: u64) {
+    ///
+    /// Public for transports outside this module, such as browser uploads, so
+    /// their bytes count towards the speed shown as well as the progress.
+    pub fn advance(&self, bytes: u64) {
+        self.bytes_moved.fetch_add(bytes, Ordering::Relaxed);
+
         let total = self.bytes_total.load(Ordering::Relaxed);
         let updated = self.bytes_done.fetch_add(bytes, Ordering::Relaxed) + bytes;
         if total > 0 && updated > total {
@@ -105,7 +122,16 @@ impl Progress {
         }
     }
 
-    /// Stop if the user asked us to, distinguishing why.
+    /// Take a figure the peer reported as the new floor for `bytes_done`,
+    /// counting any increase as bytes moved.
+    fn raise_to(&self, bytes: u64) {
+        let bytes = bytes.min(self.bytes_total.load(Ordering::Relaxed));
+        let previous = self.bytes_done.fetch_max(bytes, Ordering::Relaxed);
+        self.bytes_moved
+            .fetch_add(bytes.saturating_sub(previous), Ordering::Relaxed);
+    }
+
+    /// Stop if the user — or the other device — asked us to, distinguishing why.
     fn check_interrupted(&self) -> Result<()> {
         if self.paused() {
             return Err(Error::Paused);
@@ -113,7 +139,75 @@ impl Progress {
         if self.cancelled() {
             return Err(Error::Cancelled);
         }
-        Ok(())
+        match self.peer_stop.load(Ordering::Relaxed) {
+            PEER_PAUSED => Err(Error::PausedByPeer),
+            PEER_CANCELLED => Err(Error::CancelledByPeer),
+            _ => Ok(()),
+        }
+    }
+
+    fn note_peer_stop(&self, reason: StopReason) {
+        let code = match reason {
+            StopReason::Paused => PEER_PAUSED,
+            StopReason::Cancelled => PEER_CANCELLED,
+        };
+        self.peer_stop.store(code, Ordering::Relaxed);
+    }
+}
+
+const PEER_PAUSED: u8 = 1;
+const PEER_CANCELLED: u8 = 2;
+
+/// How often a waiting side looks at the pause and cancel flags.
+const INTERRUPT_POLL: Duration = Duration::from_millis(100);
+
+/// How often the receiver reports its totals to a sender that can read them.
+const PROGRESS_REPORT: Duration = Duration::from_millis(250);
+
+/// How long a receiver lets its transfer wind down after the sender stops, so
+/// the disk writer flushes and exits before anything else can reopen the same
+/// staging area.
+const WIND_DOWN: Duration = Duration::from_secs(10);
+
+/// Resolves when the user pauses or cancels, with the matching error.
+///
+/// Polled rather than signalled: the flags are plain atomics shared with the UI,
+/// and a tenth of a second is far below what a person notices after a click.
+async fn interrupted(progress: &Progress) -> Error {
+    let mut ticker = tokio::time::interval(INTERRUPT_POLL);
+    loop {
+        ticker.tick().await;
+        if progress.paused() {
+            return Error::Paused;
+        }
+        if progress.cancelled() {
+            return Error::Cancelled;
+        }
+    }
+}
+
+/// Tell a peer that can understand it that we stopped on purpose.
+///
+/// Best-effort: the connection is about to close either way, and the peer falls
+/// back to reporting a lost connection, which is still resumable.
+async fn announce_stop(session: &Session, error: &Error) {
+    let reason = match error {
+        Error::Paused => StopReason::Paused,
+        Error::Cancelled => StopReason::Cancelled,
+        _ => return,
+    };
+    if session.peer_has_live_status()
+        && let Err(e) = session.send_control(&Control::Stop { reason }).await
+    {
+        tracing::debug!(error = %e, "could not tell the peer the transfer was stopped");
+    }
+}
+
+/// The error for a peer that told us it stopped deliberately.
+fn stopped_by_peer(reason: StopReason) -> Error {
+    match reason {
+        StopReason::Paused => Error::PausedByPeer,
+        StopReason::Cancelled => Error::CancelledByPeer,
     }
 }
 
@@ -168,7 +262,17 @@ pub async fn send(
 
     session.send_control(&Control::Offer(offer)).await?;
 
-    match session.recv_control().await? {
+    // Waiting on a person at the other end, possibly for minutes — so pausing or
+    // cancelling here has to work too, not only once data is moving.
+    let answer = tokio::select! {
+        answer = session.recv_control() => answer?,
+        stop = interrupted(&progress) => {
+            announce_stop(session, &stop).await;
+            return Err(stop);
+        }
+    };
+
+    match answer {
         Control::Accept => {}
         Control::Reject { reason } => {
             return Err(Error::Rejected(proto::sanitize_name(&reason)));
@@ -218,6 +322,11 @@ async fn serve_requests(
     let started = std::time::Instant::now();
     let activity = Arc::new(AtomicU64::new(0));
 
+    // A receiver that reports its own totals is the authority on progress. The
+    // sender's count of bytes handed to QUIC runs up to the whole send window
+    // ahead of what has arrived, so it is only a fallback for older peers.
+    let live = session.peer_has_live_status();
+
     let done = async {
         loop {
             let message = session.recv_control().await?;
@@ -225,15 +334,30 @@ async fn serve_requests(
 
             match message {
                 Control::Complete => {
-                    // Everything arrived and verified, so the file counter can
-                    // settle at the total — see the matching note in `receive`
-                    // about files that have no chunks to report.
+                    // Everything arrived and verified, so the counters can settle
+                    // at the totals — see the matching note in `receive` about
+                    // files that have no chunks to report.
+                    progress.raise_to(progress.bytes_total.load(Ordering::Relaxed));
                     let total = progress.files_total.load(Ordering::Relaxed);
                     progress.files_done.store(total, Ordering::Relaxed);
                     return Ok(());
                 }
+                // The receiver gave up after accepting. That is never a decline:
+                // a person already said yes. Older receivers also sent this for
+                // their own pause and cancel, with the error text as the reason.
                 Control::Abort { reason } => {
-                    return Err(Error::Rejected(proto::sanitize_name(&reason)));
+                    return Err(match reason.as_str() {
+                        "paused" | "cancelled" => Error::CancelledByPeer,
+                        _ => Error::PeerFailed(proto::sanitize_name(&reason)),
+                    });
+                }
+                Control::Stop { reason } => return Err(stopped_by_peer(reason)),
+                Control::Progress { bytes, files } => {
+                    progress.raise_to(bytes);
+                    let total_files = progress.files_total.load(Ordering::Relaxed);
+                    progress
+                        .files_done
+                        .fetch_max(files.min(total_files), Ordering::Relaxed);
                 }
                 Control::Ping(nonce) => session.send_control(&Control::Pong(nonce)).await?,
                 // The receiver's resume baseline.
@@ -248,19 +372,29 @@ async fn serve_requests(
                 // Clamped to the totals, because these figures arrive from the
                 // peer and a display must not be steerable into nonsense by a
                 // number on the wire.
+                //
+                // With a live receiver nothing has been counted locally, so the
+                // baseline is simply the truth and replaces whatever the caller
+                // carried over from an earlier attempt. It is not counted as
+                // bytes moved: it was already there.
                 Control::AlreadyHave { bytes, files } => {
                     let total_bytes = progress.bytes_total.load(Ordering::Relaxed);
                     let total_files = progress.files_total.load(Ordering::Relaxed);
-                    progress
-                        .bytes_done
-                        .fetch_max(bytes.min(total_bytes), Ordering::Relaxed);
-                    progress
-                        .files_done
-                        .fetch_max(files.min(total_files), Ordering::Relaxed);
+                    let (bytes, files) = (bytes.min(total_bytes), files.min(total_files));
+                    if live {
+                        progress.bytes_done.store(bytes, Ordering::Relaxed);
+                        progress.files_done.store(files, Ordering::Relaxed);
+                    } else {
+                        progress.bytes_done.fetch_max(bytes, Ordering::Relaxed);
+                        progress.files_done.fetch_max(files, Ordering::Relaxed);
+                    }
                 }
                 // Counted rather than tracked per entry: the receiver reports each
                 // file exactly once, and a duplicate would only inflate a display
                 // number. Clamped to the total so it can never read "44 of 43".
+                // A live receiver's `Progress` already carries the file count, and
+                // adding these on top would count each file twice.
+                Control::EntryDone { .. } if live => {}
                 Control::EntryDone { .. } => {
                     let total = progress.files_total.load(Ordering::Relaxed);
                     let done = progress.files_done.load(Ordering::Relaxed);
@@ -285,7 +419,7 @@ async fn serve_requests(
             // One task per request, so a slow disk read on one file does not
             // hold up the others.
             tokio::spawn(async move {
-                if let Err(e) = answer(send, recv, &root, &manifest, progress).await {
+                if let Err(e) = answer(send, recv, &root, &manifest, progress, live).await {
                     tracing::debug!(error = %e, "data request failed");
                 }
             });
@@ -318,10 +452,17 @@ async fn serve_requests(
         }
     };
 
+    let stop = async {
+        let stop = interrupted(&progress).await;
+        announce_stop(session, &stop).await;
+        Err(stop)
+    };
+
     tokio::select! {
         result = done => result,
         result = serving => result,
         result = watchdog => result,
+        result = stop => result,
     }
 }
 
@@ -336,6 +477,7 @@ async fn answer(
     root: &Path,
     manifest: &Manifest,
     progress: Arc<Progress>,
+    live: bool,
 ) -> Result<()> {
     let request: DataRequest = proto::read_frame(&mut recv, MAX_CONTROL_FRAME).await?;
 
@@ -356,6 +498,10 @@ async fn answer(
             while let Some(prepared) = chunks.recv().await {
                 let (header, data) = prepared?;
 
+                // Stop serving the moment the user pauses or cancels, rather than
+                // finishing ranges nobody is going to wait for.
+                progress.check_interrupted()?;
+
                 // An upload cap. Independent of the receiver's own limit — either
                 // side may want to protect its link, and neither has to know
                 // about the other's choice. Whichever is lower simply wins.
@@ -364,7 +510,10 @@ async fn answer(
                 send.write_all(&header.encode()).await?;
                 send.write_all(&data).await?;
 
-                progress.advance(data.len() as u64);
+                // Bytes handed to QUIC, not bytes delivered — see `live`.
+                if !live {
+                    progress.advance(data.len() as u64);
+                }
             }
         }
         DataRequest::FileHash { entry } => {
@@ -562,7 +711,13 @@ where
         tracing::debug!(error = %e, "could not report the resume baseline to the sender");
     }
 
-    match pull_everything(session, staging, Arc::clone(&progress)).await {
+    let pulled = if session.peer_has_live_status() {
+        pull_with_live_status(session, staging, &progress).await
+    } else {
+        pull_everything(session, staging, Arc::clone(&progress)).await
+    };
+
+    match pulled {
         Ok(received) => {
             // Settle the file counter. Files with no chunks — empty ones — are
             // created during the final tear-down rather than passing through
@@ -579,12 +734,115 @@ where
         Err(e) => {
             // Staged chunks stay on disk, so this is a pause rather than a
             // loss — the next attempt picks up where this one stopped.
-            let _ = session
-                .send_control(&Control::Abort {
-                    reason: e.to_string(),
-                })
-                .await;
+            match &e {
+                // The sender stopped or vanished; there is nobody to tell.
+                Error::PausedByPeer | Error::CancelledByPeer | Error::ConnectionClosed(_) => {}
+                // Our user stopped it. A live sender is told so plainly; an older
+                // one only understands `Abort`.
+                Error::Paused | Error::Cancelled if session.peer_has_live_status() => {
+                    announce_stop(session, &e).await;
+                }
+                _ => {
+                    let _ = session
+                        .send_control(&Control::Abort {
+                            reason: e.to_string(),
+                        })
+                        .await;
+                }
+            }
             Err(e)
+        }
+    }
+}
+
+/// Pull everything while also talking to a live sender: reporting what has
+/// arrived, and listening in case it stops.
+async fn pull_with_live_status(
+    session: &Session,
+    staging: Staging,
+    progress: &Arc<Progress>,
+) -> Result<Received> {
+    let pull = pull_everything(session, staging, Arc::clone(progress));
+    tokio::pin!(pull);
+
+    let listen = listen_to_sender(session, progress);
+    tokio::pin!(listen);
+
+    tokio::select! {
+        result = &mut pull => result,
+        stopped = &mut listen => {
+            // Let the pull wind down rather than dropping it, so the disk writer
+            // finishes and releases the staging area before anything — such as
+            // the next attempt — opens it again. A deliberate stop has already
+            // told the workers to finish their current chunk and go, so this ends
+            // quickly.
+            let deliberate = matches!(stopped, Error::PausedByPeer | Error::CancelledByPeer);
+            match tokio::time::timeout(WIND_DOWN, &mut pull).await {
+                // Everything had already arrived: that is a finished transfer,
+                // whatever was said in the same moment.
+                Ok(Ok(received)) => Ok(received),
+                // A deliberate stop explains whatever the workers tripped over as
+                // the sender hung up.
+                _ if deliberate => Err(stopped),
+                // Otherwise the control stream failed because the connection did,
+                // and the pull's own error says more about where.
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(stopped),
+            }
+        }
+        never = report_to_sender(session, progress) => match never {},
+    }
+}
+
+/// Read the control stream for the life of a receive.
+///
+/// Returns only when there is a reason to stop: the sender said so, said
+/// goodbye, or the stream failed.
+async fn listen_to_sender(session: &Session, progress: &Progress) -> Error {
+    loop {
+        match session.recv_control().await {
+            Ok(Control::Stop { reason }) => {
+                progress.note_peer_stop(reason);
+                return stopped_by_peer(reason);
+            }
+            Ok(Control::Goodbye { reason }) => {
+                return Error::ConnectionClosed(proto::sanitize_name(&reason));
+            }
+            Ok(Control::Ping(nonce)) => {
+                let _ = session.send_control(&Control::Pong(nonce)).await;
+            }
+            Ok(other) => tracing::debug!(?other, "ignoring control message while receiving"),
+            Err(e) => return e,
+        }
+    }
+}
+
+/// Tell the sender how far we have got, a few times a second, for ever.
+///
+/// Only the receiver knows what has *arrived*; see [`Control::Progress`].
+async fn report_to_sender(session: &Session, progress: &Progress) -> std::convert::Infallible {
+    let mut ticker = tokio::time::interval(PROGRESS_REPORT);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = None;
+
+    loop {
+        ticker.tick().await;
+
+        let now = (
+            progress.bytes_done.load(Ordering::Relaxed),
+            progress.files_done.load(Ordering::Relaxed),
+        );
+        if last == Some(now) {
+            continue;
+        }
+        last = Some(now);
+
+        let report = Control::Progress {
+            bytes: now.0,
+            files: now.1,
+        };
+        if let Err(e) = session.send_control(&report).await {
+            tracing::debug!(error = %e, "could not report progress to the sender");
         }
     }
 }
@@ -609,6 +867,8 @@ async fn read_manifest(session: &Session, expected_entries: u64) -> Result<Manif
                     break;
                 }
             }
+            // The sender gave up while we were deciding.
+            Control::Stop { reason } => return Err(stopped_by_peer(reason)),
             other => {
                 return Err(Error::Protocol(format!(
                     "expected a manifest batch, got {other:?}"
@@ -927,7 +1187,10 @@ fn run_writer(
             } => {
                 // Verification happens in here, before anything reaches the
                 // partial file.
-                staging.write_chunk(entry, index, &data, &hash)?;
+                if let Err(e) = staging.write_chunk(entry, index, &data, &hash) {
+                    keep_what_arrived(&mut staging);
+                    return Err(e);
+                }
             }
 
             WriteCommand::Finish {
@@ -958,7 +1221,16 @@ fn run_writer(
         }
     }
 
+    // Every sender is gone without a `Complete`: the transfer stopped early.
+    keep_what_arrived(&mut staging);
     Ok(placed)
+}
+
+/// Record everything written so far, so the next attempt resumes from it.
+fn keep_what_arrived(staging: &mut Staging) {
+    if let Err(e) = staging.checkpoint_all() {
+        tracing::warn!(error = %e, "could not record progress; some data may be fetched again");
+    }
 }
 
 /// Fetch one range and hand each chunk to the writer.
@@ -1008,12 +1280,31 @@ async fn pull_range(
             )));
         }
 
+        // Read in whatever pieces arrive and count each one, rather than one
+        // whole chunk at a time. Eight streams share the link, so whole chunks
+        // finished in near-lockstep: on a slow link nothing was counted for a
+        // second or more and then eight megabytes at once, and the speed shown
+        // flipped between zero and double.
         let mut data = vec![0u8; header.len as usize];
-        recv.read_exact(&mut data)
-            .await
-            .map_err(|e| Error::Transport(format!("chunk {}: {e}", header.index)))?;
-
-        let len = data.len() as u64;
+        let mut filled = 0;
+        while filled < data.len() {
+            match recv.read(&mut data[filled..]).await {
+                Ok(Some(read)) => {
+                    filled += read;
+                    progress.advance(read as u64);
+                }
+                Ok(None) => {
+                    return Err(Error::Transport(format!(
+                        "chunk {}: the stream ended {} bytes early",
+                        header.index,
+                        data.len() - filled
+                    )));
+                }
+                Err(e) => {
+                    return Err(Error::Transport(format!("chunk {}: {e}", header.index)));
+                }
+            }
+        }
 
         // The channel is bounded, so a disk that cannot keep up applies
         // backpressure here rather than growing a queue without limit.
@@ -1026,8 +1317,6 @@ async fn pull_range(
             })
             .await
             .map_err(|_| Error::Io(std::io::Error::other("the disk writer stopped")))?;
-
-        progress.advance(len);
     }
 
     Ok(())

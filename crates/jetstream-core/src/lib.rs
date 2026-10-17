@@ -19,6 +19,7 @@ pub mod identity;
 pub mod manifest;
 pub mod path;
 pub mod proto;
+pub mod rate;
 pub mod staging;
 pub mod throttle;
 pub mod tls;

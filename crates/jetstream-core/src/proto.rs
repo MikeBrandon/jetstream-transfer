@@ -67,6 +67,36 @@ pub struct Capabilities {
     pub zstd: bool,
     /// Peer understands bundled small-file chunks.
     pub bundling: bool,
+    /// Peer keeps reading the control stream for the whole transfer and
+    /// understands [`Control::Progress`] and [`Control::Stop`].
+    ///
+    /// Gated rather than assumed because postcard cannot skip an enum variant it
+    /// does not know: an older build that receives either message fails to
+    /// decode it and drops the transfer. So both are only ever sent to a peer
+    /// that said it understands them.
+    pub live_status: bool,
+}
+
+/// [`Capabilities`] as builds before `live_status` encoded them.
+///
+/// A newer peer reading an older `Hello` runs out of bytes before the new field,
+/// which postcard reports as an error rather than a default. Decoding falls back
+/// to this shape so the two builds can still talk — the older one simply gets
+/// none of the newer messages.
+#[derive(Deserialize)]
+struct LegacyCapabilities {
+    zstd: bool,
+    bundling: bool,
+}
+
+#[derive(Deserialize)]
+struct LegacyHello {
+    version: u16,
+    device_id: DeviceId,
+    name: String,
+    platform: Platform,
+    app_version: String,
+    capabilities: LegacyCapabilities,
 }
 
 /// First message on the control stream, sent by both sides.
@@ -98,9 +128,49 @@ impl Hello {
             capabilities: Capabilities {
                 zstd: false,
                 bundling: false,
+                live_status: true,
             },
         }
     }
+
+    /// Decode a `Hello` from any build, current or older.
+    ///
+    /// The current layout is tried first. An older peer's `Hello` is shorter by
+    /// the capabilities it predates, so it is decoded as such and the missing
+    /// capabilities read as unsupported. Extra trailing bytes from a *newer* peer
+    /// are already ignored by postcard, which is what keeps this working in the
+    /// other direction too.
+    pub fn decode(body: &[u8]) -> Result<Self> {
+        if let Ok(hello) = postcard::from_bytes::<Self>(body) {
+            return Ok(hello);
+        }
+
+        let legacy: LegacyHello = postcard::from_bytes(body)
+            .map_err(|e| Error::Protocol(format!("malformed hello: {e}")))?;
+
+        Ok(Self {
+            version: legacy.version,
+            device_id: legacy.device_id,
+            name: legacy.name,
+            platform: legacy.platform,
+            app_version: legacy.app_version,
+            capabilities: Capabilities {
+                zstd: legacy.capabilities.zstd,
+                bundling: legacy.capabilities.bundling,
+                live_status: false,
+            },
+        })
+    }
+}
+
+/// Why one side deliberately stopped a transfer that was under way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopReason {
+    /// Stopped to be continued later. Staged data is kept.
+    Paused,
+    /// Stopped and not coming back by itself. Staged data is still kept, so a
+    /// later send of the same files continues rather than restarts.
+    Cancelled,
 }
 
 /// What a sender proposes, and what the receiver shows the user before
@@ -174,6 +244,23 @@ pub enum Control {
     /// Informational like [`Control::EntryDone`], so an older peer simply keeps
     /// the old misleading numbers rather than failing.
     AlreadyHave { bytes: u64, files: u64 },
+
+    /// The receiver's running totals, sent a few times a second.
+    ///
+    /// The sender cannot tell on its own how much has *arrived*: it only sees
+    /// what it hands to QUIC, and QUIC buffers far ahead of the network. Counting
+    /// that made a sending device race to 100% at disk speed and then sit there
+    /// while the data was still on the wire. The receiver's figure is the one the
+    /// user means. Only sent to a peer with [`Capabilities::live_status`].
+    Progress { bytes: u64, files: u64 },
+
+    /// This side stopped on purpose — the user paused or cancelled.
+    ///
+    /// Distinct from [`Control::Abort`], which means something went wrong. The
+    /// difference decides what the other device shows and whether it retries:
+    /// a pause is not a failure, and a cancel is not a decline. Only sent to a
+    /// peer with [`Capabilities::live_status`].
+    Stop { reason: StopReason },
 }
 
 /// A request the receiver writes on a fresh data stream.
@@ -289,6 +376,17 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    let body = read_frame_bytes(reader, limit).await?;
+    postcard::from_bytes(&body).map_err(|e| Error::Protocol(format!("malformed message: {e}")))
+}
+
+/// Read one length-prefixed frame without decoding it.
+///
+/// For messages that need a decoding fallback, such as [`Hello::decode`].
+pub async fn read_frame_bytes<R>(reader: &mut R, limit: usize) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes) as usize;
@@ -299,8 +397,7 @@ where
 
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
-
-    postcard::from_bytes(&body).map_err(|e| Error::Protocol(format!("malformed message: {e}")))
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -361,6 +458,43 @@ mod tests {
         buf.truncate(buf.len() - 3);
 
         assert!(read_frame::<_, Hello>(&mut buf.as_slice(), MAX_CONTROL_FRAME).await.is_err());
+    }
+
+    /// A `Hello` exactly as builds before `live_status` wrote it.
+    #[derive(Serialize)]
+    struct OldHello {
+        version: u16,
+        device_id: DeviceId,
+        name: String,
+        platform: Platform,
+        app_version: String,
+        capabilities: (bool, bool),
+    }
+
+    #[test]
+    fn an_older_peers_hello_still_decodes_without_the_new_capability() {
+        let old = OldHello {
+            version: PROTOCOL_VERSION,
+            device_id: DeviceId::from_bytes([3u8; DEVICE_ID_LEN]),
+            name: "Old Build".into(),
+            platform: Platform::Windows,
+            app_version: "0.1.0".into(),
+            capabilities: (false, false),
+        };
+        let body = postcard::to_stdvec(&old).unwrap();
+
+        let decoded = Hello::decode(&body).unwrap();
+        assert_eq!(decoded.name, "Old Build");
+        assert!(
+            !decoded.capabilities.live_status,
+            "an older build must never be sent messages it cannot decode"
+        );
+    }
+
+    #[test]
+    fn a_newer_hello_decodes_with_its_capabilities() {
+        let body = postcard::to_stdvec(&test_hello()).unwrap();
+        assert!(Hello::decode(&body).unwrap().capabilities.live_status);
     }
 
     #[test]

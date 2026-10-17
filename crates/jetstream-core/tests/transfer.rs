@@ -397,6 +397,20 @@ async fn an_interrupted_transfer_resumes_instead_of_restarting() {
         "and the baseline must include what was already staged"
     );
 
+    // What was already there is progress, not speed. Both ends must measure only
+    // what crossed the wire this time, or every resume opens with an absurd
+    // spike in the rate.
+    let moved = resume_progress.bytes_moved.load(Ordering::Relaxed);
+    assert!(
+        moved < SIZE as u64,
+        "the receiver should only have moved the missing part, moved {moved}"
+    );
+    assert_eq!(
+        resume_send_progress.bytes_moved.load(Ordering::Relaxed),
+        moved,
+        "the sender's measure of what moved should match the receiver's"
+    );
+
     assert_trees_match(&root, &destination.path().join("payload"));
 }
 
@@ -797,4 +811,160 @@ async fn a_tree_of_many_small_files_transfers_correctly() {
     within(sending).await.unwrap().unwrap();
 
     assert_trees_match(&root, &destination.path().join("payload"));
+}
+
+/// Start a send of `root` on its own task.
+fn spawn_send(
+    pair: &Pair,
+    root: &Path,
+    manifest: &Manifest,
+    progress: &Arc<Progress>,
+) -> tokio::task::JoinHandle<jetstream_core::Result<()>> {
+    let session = Arc::clone(&pair.sender);
+    let parent = root.parent().unwrap().to_path_buf();
+    let manifest = manifest.clone();
+    let progress = Arc::clone(progress);
+    tokio::spawn(async move { transfer::send(&session, &parent, &manifest, progress).await })
+}
+
+/// Set `flag` once `progress` has passed `bytes`.
+fn trip_after(
+    progress: &Arc<Progress>,
+    bytes: u64,
+    flag: impl Fn(&Progress) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    let progress = Arc::clone(progress);
+    tokio::spawn(async move {
+        loop {
+            if progress.bytes_done.load(Ordering::Relaxed) >= bytes {
+                flag(&progress);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+}
+
+/// Pausing used to be a no-op on the sending side: nothing there ever looked at
+/// the flag, so the transfer simply carried on to the end.
+#[tokio::test]
+async fn pausing_the_sender_stops_both_ends_and_the_receiver_knows_why() {
+    let (_source_dir, root) = source_tree(&[("big.bin", 24 * 1024 * 1024)]);
+    let destination = tempfile::tempdir().unwrap();
+    let (manifest, _) = Manifest::from_paths(std::slice::from_ref(&root)).unwrap();
+
+    let pair = connect_pair().await;
+    let send_progress = Arc::new(Progress::default());
+    let receive_progress = Arc::new(Progress::default());
+    // Slow enough that the pause lands mid-transfer.
+    receive_progress.limit.set(8 * 1024 * 1024);
+
+    let sending = spawn_send(&pair, &root, &manifest, &send_progress);
+    let watcher = trip_after(&send_progress, 2 * 1024 * 1024, |p| {
+        p.pause.store(true, Ordering::Relaxed)
+    });
+
+    let received = within(transfer::receive(
+        &pair.receiver,
+        accept_into(destination.path()),
+        Arc::clone(&receive_progress),
+    ))
+    .await;
+    let sent = within(sending).await.unwrap();
+    watcher.abort();
+
+    assert!(matches!(sent, Err(jetstream_core::Error::Paused)), "sender got {sent:?}");
+    assert!(
+        matches!(received, Err(jetstream_core::Error::PausedByPeer)),
+        "receiver got {received:?} — it should know the sender paused, not that the network died"
+    );
+    assert!(
+        receive_progress.bytes_done.load(Ordering::Relaxed) < 24 * 1024 * 1024,
+        "the transfer should have stopped part way"
+    );
+}
+
+/// A receiver stopping used to reach the sender as a *decline*, which also
+/// stopped it ever being resumed.
+#[tokio::test]
+async fn cancelling_the_receiver_is_not_reported_as_a_decline() {
+    let (_source_dir, root) = source_tree(&[("big.bin", 24 * 1024 * 1024)]);
+    let destination = tempfile::tempdir().unwrap();
+    let (manifest, _) = Manifest::from_paths(std::slice::from_ref(&root)).unwrap();
+
+    let pair = connect_pair().await;
+    let send_progress = Arc::new(Progress::default());
+    let receive_progress = Arc::new(Progress::default());
+    receive_progress.limit.set(8 * 1024 * 1024);
+
+    let sending = spawn_send(&pair, &root, &manifest, &send_progress);
+    let watcher = trip_after(&receive_progress, 2 * 1024 * 1024, |p| {
+        p.cancel.store(true, Ordering::Relaxed)
+    });
+
+    let received = within(transfer::receive(
+        &pair.receiver,
+        accept_into(destination.path()),
+        Arc::clone(&receive_progress),
+    ))
+    .await;
+    let sent = within(sending).await.unwrap();
+    watcher.abort();
+
+    assert!(matches!(received, Err(jetstream_core::Error::Cancelled)), "receiver got {received:?}");
+    assert!(
+        matches!(sent, Err(jetstream_core::Error::CancelledByPeer)),
+        "sender got {sent:?}"
+    );
+}
+
+/// The sender used to count bytes as it handed them to QUIC, which buffers far
+/// ahead of the network: it showed disk speed, reached 100% early and sat
+/// there. It now shows what the receiver says has arrived.
+#[tokio::test]
+async fn the_sender_shows_what_arrived_not_what_it_buffered() {
+    const SIZE: u64 = 16 * 1024 * 1024;
+    let (_source_dir, root) = source_tree(&[("big.bin", SIZE as usize)]);
+    let destination = tempfile::tempdir().unwrap();
+    let (manifest, _) = Manifest::from_paths(std::slice::from_ref(&root)).unwrap();
+
+    let pair = connect_pair().await;
+    let send_progress = Arc::new(Progress::default());
+    let receive_progress = Arc::new(Progress::default());
+    receive_progress.limit.set(8 * 1024 * 1024);
+
+    let sending = spawn_send(&pair, &root, &manifest, &send_progress);
+
+    let sampler = {
+        let send_progress = Arc::clone(&send_progress);
+        let receive_progress = Arc::clone(&receive_progress);
+        tokio::spawn(async move {
+            let mut ahead = 0u64;
+            loop {
+                // Sender first: the receiver's figure only grows, so reading it
+                // second can only make the comparison kinder to the sender.
+                let sent = send_progress.bytes_done.load(Ordering::Relaxed);
+                let arrived = receive_progress.bytes_done.load(Ordering::Relaxed);
+                ahead = ahead.max(sent.saturating_sub(arrived));
+                if arrived >= SIZE {
+                    return ahead;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    within(transfer::receive(
+        &pair.receiver,
+        accept_into(destination.path()),
+        Arc::clone(&receive_progress),
+    ))
+    .await
+    .unwrap();
+    within(sending).await.unwrap().unwrap();
+
+    let ahead = within(sampler).await.unwrap();
+    assert_eq!(ahead, 0, "the sender ran {ahead} bytes ahead of what had arrived");
+    assert_eq!(send_progress.bytes_done.load(Ordering::Relaxed), SIZE);
+    assert_eq!(send_progress.bytes_moved.load(Ordering::Relaxed), SIZE);
 }

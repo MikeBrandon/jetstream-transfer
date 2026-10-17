@@ -495,25 +495,33 @@ fn confirm(question: &str) -> bool {
 /// Redraw a one-line progress indicator until the transfer ends.
 async fn report_progress(progress: Arc<Progress>) {
     use std::io::Write;
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
-    let started = std::time::Instant::now();
+    use std::sync::atomic::Ordering;
+
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    // Measured from bytes that moved, not bytes done: on a resume the latter
+    // starts at everything already there, which is not speed.
+    let mut meter = jetstream_core::rate::RateMeter::new();
 
     loop {
         ticker.tick().await;
 
-        let total = progress.bytes_total.load(std::sync::atomic::Ordering::Relaxed);
+        meter.update(
+            std::time::Instant::now(),
+            progress.bytes_moved.load(Ordering::Relaxed),
+        );
+
+        let total = progress.bytes_total.load(Ordering::Relaxed);
         if total == 0 {
             continue;
         }
-        let done = progress.bytes_done.load(std::sync::atomic::Ordering::Relaxed);
-        let rate = done as f64 / started.elapsed().as_secs_f64().max(0.001);
+        let done = progress.bytes_done.load(Ordering::Relaxed);
 
         print!(
             "\r     {:>5.1}%  {} / {}  at {}/s     ",
             progress.fraction() * 100.0,
             transfer::human_bytes(done),
             transfer::human_bytes(total),
-            transfer::human_bytes(rate as u64),
+            transfer::human_bytes(meter.rate()),
         );
         let _ = std::io::stdout().flush();
     }
@@ -1002,6 +1010,20 @@ fn print_firewall_status() {
         RuleStatus::Unknown(detail) => {
             println!("[note] Could not check the firewall: {detail}");
         }
+    }
+
+    // Phone sharing is a web server, so it needs TCP as well — the rule above
+    // only covers QUIC.
+    if matches!(
+        firewall::browser_status(&exe),
+        RuleStatus::Absent | RuleStatus::Moved(_)
+    ) {
+        println!("[note] Phones and browsers cannot reach `jet browser` through the firewall.");
+        println!("       To allow them, from an administrator terminal:");
+        println!();
+        println!("         netsh advfirewall firewall delete rule name=\"{}\"", firewall::BROWSER_RULE_NAME);
+        println!("         netsh advfirewall firewall add rule name=\"{}\" \\", firewall::BROWSER_RULE_NAME);
+        println!("           dir=in action=allow protocol=TCP remoteip=localsubnet program=\"{}\"", exe.display());
     }
 }
 

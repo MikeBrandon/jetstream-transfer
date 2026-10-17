@@ -42,6 +42,16 @@ use std::path::PathBuf;
 /// name rather than something internal.
 pub const RULE_NAME: &str = "Jetstream";
 
+/// The second rule, for phone sharing.
+///
+/// The browser receiver is a web server, which means TCP — and the first rule
+/// only ever opened UDP, because that is all QUIC needs. So a phone that scanned
+/// the code got nowhere: Windows dropped the connection silently, the page never
+/// loaded, and the app still reported the firewall as fine. A separate rule
+/// rather than widening the first keeps each hole as narrow as its purpose, and
+/// lets the phone one be limited to the local subnet.
+pub const BROWSER_RULE_NAME: &str = "Jetstream (phone sharing)";
+
 /// Argument that turns a normal launch into the elevated helper.
 pub const INSTALL_ARG: &str = "--allow-firewall";
 
@@ -88,7 +98,7 @@ pub fn current_exe() -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{install, is_elevated, request_elevation, status};
+pub use windows_impl::{browser_status, install, is_elevated, request_elevation, status};
 
 #[cfg(not(windows))]
 mod stubs {
@@ -98,6 +108,10 @@ mod stubs {
     /// program by default the way Windows does, and none with a common API.
     /// Reporting `Unknown` keeps the UI honest instead of claiming a check ran.
     pub fn status(_exe: &std::path::Path) -> RuleStatus {
+        RuleStatus::Unknown("firewall checks are only implemented on Windows".into())
+    }
+
+    pub fn browser_status(_exe: &std::path::Path) -> RuleStatus {
         RuleStatus::Unknown("firewall checks are only implemented on Windows".into())
     }
 
@@ -115,7 +129,7 @@ mod stubs {
 }
 
 #[cfg(not(windows))]
-pub use stubs::{install, is_elevated, request_elevation, status};
+pub use stubs::{browser_status, install, is_elevated, request_elevation, status};
 
 #[cfg(windows)]
 mod windows_impl {
@@ -123,8 +137,8 @@ mod windows_impl {
 
     use windows::Win32::Foundation::VARIANT_BOOL;
     use windows::Win32::NetworkManagement::WindowsFirewall::{
-        INetFwPolicy2, INetFwRule, NET_FW_ACTION_ALLOW, NET_FW_IP_PROTOCOL_UDP,
-        NET_FW_PROFILE2_ALL, NET_FW_RULE_DIR_IN, NetFwPolicy2, NetFwRule,
+        INetFwPolicy2, INetFwRule, INetFwRules, NET_FW_ACTION_ALLOW, NET_FW_IP_PROTOCOL_TCP,
+        NET_FW_IP_PROTOCOL_UDP, NET_FW_PROFILE2_ALL, NET_FW_RULE_DIR_IN, NetFwPolicy2, NetFwRule,
     };
     use windows::Win32::Security::{TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
     use windows::Win32::System::Com::{
@@ -135,7 +149,7 @@ mod windows_impl {
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     use windows::core::{BSTR, PCWSTR};
 
-    use super::{RULE_NAME, RuleStatus};
+    use super::{BROWSER_RULE_NAME, RULE_NAME, RuleStatus};
 
     /// Initialises COM for the duration of a call. See the identical guard in
     /// [`crate::diagnostics`] for why this is per-call rather than global.
@@ -175,6 +189,15 @@ mod windows_impl {
     /// install in a different location is treated as absent rather than
     /// silently trusted.
     pub fn status(exe: &Path) -> RuleStatus {
+        rule_status(exe, RULE_NAME)
+    }
+
+    /// The same check for the phone-sharing rule. See [`BROWSER_RULE_NAME`].
+    pub fn browser_status(exe: &Path) -> RuleStatus {
+        rule_status(exe, BROWSER_RULE_NAME)
+    }
+
+    fn rule_status(exe: &Path, name: &str) -> RuleStatus {
         let _com = ComGuard::new();
 
         let policy = match policy() {
@@ -190,7 +213,7 @@ mod windows_impl {
 
         // SAFETY: as above. A missing rule is reported as an error, which is
         // the documented behaviour and not a failure on our part.
-        let rule = match unsafe { rules.Item(&BSTR::from(RULE_NAME)) } {
+        let rule = match unsafe { rules.Item(&BSTR::from(name)) } {
             Ok(rule) => rule,
             Err(_) => return RuleStatus::Absent,
         };
@@ -241,11 +264,15 @@ mod windows_impl {
         }
     }
 
-    /// Add the inbound rule. **Requires administrator rights.**
+    /// Add both inbound rules. **Requires administrator rights.**
     ///
-    /// Only UDP inbound is opened, because that is all QUIC uses. A narrower
-    /// hole than the "allow this app everything" a user would end up clicking
-    /// in the Windows dialog.
+    /// Each opens only what its purpose needs, a narrower hole than the "allow
+    /// this app everything" a user would end up clicking in the Windows dialog:
+    ///
+    /// - UDP from anywhere, for QUIC — which is all native transfers use, and
+    ///   which has to work across routed subnets and VPNs.
+    /// - TCP from the local subnet only, for the phone-sharing web server. It
+    ///   only ever serves devices on the same network, so the rule says so.
     pub fn install(exe: &Path) -> Result<(), String> {
         let _com = ComGuard::new();
         let policy = policy()?;
@@ -254,10 +281,37 @@ mod windows_impl {
         let rules = unsafe { policy.Rules() }
             .map_err(|e| format!("could not open the firewall rule list: {e}"))?;
 
+        add_rule(
+            &rules,
+            exe,
+            RULE_NAME,
+            "Lets other devices on your network send files to Jetstream.",
+            NET_FW_IP_PROTOCOL_UDP.0,
+            None,
+        )?;
+        add_rule(
+            &rules,
+            exe,
+            BROWSER_RULE_NAME,
+            "Lets a phone or browser on your network connect to Jetstream's phone sharing.",
+            NET_FW_IP_PROTOCOL_TCP.0,
+            Some("LocalSubnet"),
+        )
+    }
+
+    /// Replace the rule called `name` with a fresh one for `exe`.
+    fn add_rule(
+        rules: &INetFwRules,
+        exe: &Path,
+        name: &str,
+        description: &str,
+        protocol: i32,
+        remote_addresses: Option<&str>,
+    ) -> Result<(), String> {
         // Replace rather than duplicate: re-running after moving the app should
         // update the path, not leave two rules behind.
         // SAFETY: removing a rule that does not exist is a no-op error we drop.
-        let _ = unsafe { rules.Remove(&BSTR::from(RULE_NAME)) };
+        let _ = unsafe { rules.Remove(&BSTR::from(name)) };
 
         // SAFETY: standard COM activation.
         let rule: INetFwRule = unsafe { CoCreateInstance(&NetFwRule, None, CLSCTX_ALL) }
@@ -268,18 +322,18 @@ mod windows_impl {
         // SAFETY: `rule` is a live interface pointer and every argument
         // outlives the call.
         unsafe {
-            rule.SetName(&BSTR::from(RULE_NAME))
-                .and_then(|_| {
-                    rule.SetDescription(&BSTR::from(
-                        "Lets other devices on your network send files to Jetstream.",
-                    ))
-                })
+            rule.SetName(&BSTR::from(name))
+                .and_then(|_| rule.SetDescription(&BSTR::from(description)))
                 .and_then(|_| rule.SetApplicationName(&exe_path))
-                .and_then(|_| rule.SetProtocol(NET_FW_IP_PROTOCOL_UDP.0))
+                .and_then(|_| rule.SetProtocol(protocol))
                 .and_then(|_| rule.SetDirection(NET_FW_RULE_DIR_IN))
                 .and_then(|_| rule.SetAction(NET_FW_ACTION_ALLOW))
                 .and_then(|_| rule.SetProfiles(NET_FW_PROFILE2_ALL.0))
                 .and_then(|_| rule.SetGrouping(&BSTR::from(RULE_NAME)))
+                .and_then(|_| match remote_addresses {
+                    Some(addresses) => rule.SetRemoteAddresses(&BSTR::from(addresses)),
+                    None => Ok(()),
+                })
                 .and_then(|_| rule.SetEnabled(VARIANT_BOOL::from(true)))
         }
         .map_err(|e| format!("could not configure the firewall rule: {e}"))?;

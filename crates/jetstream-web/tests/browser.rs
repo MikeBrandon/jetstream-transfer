@@ -172,10 +172,15 @@ impl Client {
         self.send("PUT", path, Some("application/octet-stream"), body).await
     }
 
-    /// Scan a pairing code and keep the session cookie.
+    /// Scan a pairing code and keep the session cookie — what a real browser
+    /// does: open the link, then submit the page's form.
     async fn pair(&mut self, token: &str) -> bool {
-        let reply = self.get(&format!("/j/{token}")).await;
+        let opened = self.get(&format!("/j/{token}")).await;
+        if opened.status != 200 {
+            return false;
+        }
 
+        let reply = self.send("POST", &format!("/j/{token}"), None, b"").await;
         if let Some(set) = reply.header("set-cookie") {
             self.cookie = set.split(';').next().map(str::to_string);
         }
@@ -215,7 +220,64 @@ fn payload(len: usize, seed: u8) -> Vec<u8> {
 }
 
 async fn serve(app: Arc<TestApp>) -> WebServer {
-    WebServer::start(app).await.expect("a LAN address is needed for these tests")
+    // Any free port: tests run side by side, and one reusing the preferred port
+    // just after another released it would make the stop test meaningless.
+    WebServer::start_on(app, 0)
+        .await
+        .expect("a LAN address is needed for these tests")
+}
+
+/// Link previews and QR scanner apps fetch a URL before the person's browser
+/// does. When that fetch spent the code, scanning appeared to do nothing.
+#[tokio::test]
+async fn opening_the_link_does_not_spend_the_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(TestApp::new(dir.path().to_path_buf(), true)).await;
+    let code = server.pairing_code();
+
+    let mut preview = Client::new(server.address());
+    let fetched = preview.get(&format!("/j/{}", code.token)).await;
+    assert_eq!(fetched.status, 200);
+    assert!(fetched.header("set-cookie").is_none(), "a GET must not start a session");
+
+    let mut browser = Client::new(server.address());
+    assert!(
+        browser.pair(&code.token).await,
+        "the person's own browser must still be able to use the code"
+    );
+
+    server.stop().await;
+}
+
+/// `Strict` cookies are withheld from navigations some phone browsers treat as
+/// coming from outside — such as a link opened from the camera.
+#[tokio::test]
+async fn the_session_cookie_survives_a_link_opened_from_another_app() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(TestApp::new(dir.path().to_path_buf(), true)).await;
+    let code = server.pairing_code();
+    let mut client = Client::new(server.address());
+
+    client.get(&format!("/j/{}", code.token)).await;
+    let reply = client.send("POST", &format!("/j/{}", code.token), None, b"").await;
+    let cookie = reply.header("set-cookie").unwrap_or_default();
+    assert!(cookie.contains("SameSite=Lax"), "got {cookie}");
+    assert!(cookie.contains("HttpOnly"));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_expired_or_unknown_link_says_so_straight_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = serve(TestApp::new(dir.path().to_path_buf(), true)).await;
+    let mut client = Client::new(server.address());
+
+    let reply = client.get("/j/00000000000000000000000000000000").await;
+    assert_eq!(reply.status, 403);
+    assert!(reply.text().contains("expired"));
+
+    server.stop().await;
 }
 
 #[tokio::test]

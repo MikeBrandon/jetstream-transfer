@@ -5,7 +5,7 @@
 //! folded into the handshake, and connection migration — a laptop that moves
 //! from Ethernet to Wi-Fi keeps its transfer instead of restarting it.
 
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,10 +88,10 @@ const MTU_UPPER_BOUND: u16 = 9000;
 ///
 /// 1 MiB is chosen deliberately for a LAN: it is aggressive by internet
 /// standards, and appropriate here because the path is a switch away and there
-/// is no shared bottleneck to be a bad neighbour on. **If a relay or
-/// internet-transfer path is ever added, it must not use this** — it should keep
-/// the conservative default, because on a WAN this would be antisocial and would
-/// likely cause loss.
+/// is no shared bottleneck to be a bad neighbour on. **A path that leaves the
+/// LAN must not use this** — see [`is_lan`], which keeps VPN and internet
+/// addresses on the conservative defaults, where a megabyte-sized first burst
+/// mostly produces loss and a collapsed window.
 const INITIAL_WINDOW: u64 = 1024 * 1024;
 
 /// UDP socket buffer size requested from the OS.
@@ -106,7 +106,8 @@ const SOCKET_BUFFER: usize = 8 * 1024 * 1024;
 pub struct Endpoint {
     inner: quinn::Endpoint,
     identity: Arc<Identity>,
-    local_name: Arc<str>,
+    /// Shared by every clone, so a rename reaches whichever one dials next.
+    local_name: Arc<std::sync::RwLock<String>>,
 }
 
 impl Endpoint {
@@ -134,19 +135,36 @@ impl Endpoint {
         Ok(Self {
             inner,
             identity,
-            local_name: proto_name(local_name.into()).into(),
+            local_name: Arc::new(std::sync::RwLock::new(proto_name(local_name.into()))),
         })
     }
 
     /// Bind a dual-stack socket on every interface.
     ///
     /// See [`bind_socket`] for why this cannot simply hand `[::]` to quinn.
+    ///
+    /// Falls back to IPv4 alone on a machine with IPv6 switched off entirely,
+    /// where the dual-stack socket cannot even be created. Refusing to start
+    /// there would make the app useless on networks that are IPv4 anyway.
     pub fn bind_all(identity: Arc<Identity>, local_name: impl Into<String>, port: u16) -> Result<Self> {
-        Self::bind(
-            identity,
-            local_name,
+        let local_name = local_name.into();
+
+        match Self::bind(
+            Arc::clone(&identity),
+            local_name.clone(),
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
-        )
+        ) {
+            Err(Error::Io(e)) if ipv6_unavailable(&e) => {
+                tracing::info!("IPv6 is unavailable here; listening on IPv4 only");
+                Self::bind(identity, local_name, SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+            }
+            other => other,
+        }
+    }
+
+    /// Change the name this device gives in every handshake from now on.
+    pub fn rename(&self, name: &str) {
+        *self.local_name.write().expect("name poisoned") = proto_name(name.to_string());
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -169,7 +187,9 @@ impl Endpoint {
             .map_err(|e| Error::Crypto(format!("QUIC rejected the TLS config: {e}")))?;
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-        client_config.transport_config(Arc::new(transport_config()));
+        // The dialer is the side that sends the files, so its congestion
+        // settings are the ones that matter — and it knows where it is dialling.
+        client_config.transport_config(Arc::new(transport_config_for(is_lan(addr))));
 
         let connection = self
             .inner
@@ -241,6 +261,30 @@ impl Endpoint {
         )))
     }
 
+    /// Check that `expected` is answering at `addr`, without starting a session.
+    ///
+    /// Completes the QUIC handshake — which proves the key, since the identity
+    /// is pinned — and hangs up before any application traffic. That keeps it
+    /// invisible on the other side: no session, no row in its transfer list, on
+    /// this build or an older one.
+    pub async fn probe(&self, addr: SocketAddr, expected: DeviceId) -> Result<()> {
+        let crypto = QuicClientConfig::try_from(tls::client_config(&self.identity, Some(expected))?)
+            .map_err(|e| Error::Crypto(format!("QUIC rejected the TLS config: {e}")))?;
+
+        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        client_config.transport_config(Arc::new(transport_config_for(is_lan(addr))));
+
+        let connection = self
+            .inner
+            .connect_with(client_config, addr, tls::CERT_SUBJECT)
+            .map_err(Error::transport)?
+            .await
+            .map_err(|e| map_connection_error(e, Some(expected)))?;
+
+        connection.close(0u32.into(), b"probe");
+        Ok(())
+    }
+
     /// Await the next inbound session.
     ///
     /// Returns `None` once the endpoint is closed. A failed handshake yields
@@ -266,8 +310,16 @@ impl Endpoint {
     }
 
     fn hello(&self) -> Hello {
-        Hello::new(self.identity.device_id(), self.local_name.as_ref())
+        let name = self.local_name.read().expect("name poisoned").clone();
+        Hello::new(self.identity.device_id(), name)
     }
+}
+
+/// Whether a socket error means this machine has no IPv6 at all.
+///
+/// `EAFNOSUPPORT` on Linux (97) and macOS (47), `WSAEAFNOSUPPORT` on Windows.
+fn ipv6_unavailable(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(97 | 47 | 10047))
 }
 
 fn proto_name(name: String) -> String {
@@ -315,7 +367,34 @@ fn bind_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
+/// Whether `addr` is on a local network rather than across a VPN or the
+/// internet.
+///
+/// By address class, because nothing better is known before the first packet.
+/// Private, link-local and loopback addresses are a LAN. Everything else —
+/// including Radmin's `26.0.0.0/8` and Tailscale's `100.64.0.0/10`, which are
+/// how VPN peers usually appear — is treated as a path that leaves the building.
+fn is_lan(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                // fe80::/10, link-local
+                || first & 0xffc0 == 0xfe80
+                // fc00::/7, unique local
+                || first & 0xfe00 == 0xfc00
+        }
+    }
+}
+
+/// Transport settings for the listening side, which mostly receives.
 fn transport_config() -> quinn::TransportConfig {
+    transport_config_for(true)
+}
+
+/// Transport settings, tuned for a LAN or left conservative for anything else.
+fn transport_config_for(lan: bool) -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
     config
         .max_idle_timeout(Some(
@@ -331,6 +410,12 @@ fn transport_config() -> quinn::TransportConfig {
         .stream_receive_window(STREAM_RECEIVE_WINDOW.into())
         .send_window(SEND_WINDOW);
 
+    if !lan {
+        // A VPN tunnel or the internet: quinn's defaults are tuned for exactly
+        // this, and the LAN shortcuts below would only cause loss.
+        return config;
+    }
+
     // Let path-MTU discovery look for jumbo frames. See MTU_UPPER_BOUND.
     let mut mtud = quinn::MtuDiscoveryConfig::default();
     mtud.upper_bound(MTU_UPPER_BOUND);
@@ -343,6 +428,35 @@ fn transport_config() -> quinn::TransportConfig {
     config.congestion_controller_factory(Arc::new(cubic));
 
     config
+}
+
+#[cfg(test)]
+mod lan_tests {
+    use super::is_lan;
+
+    #[test]
+    fn local_addresses_get_the_lan_tuning_and_vpn_addresses_do_not() {
+        for lan in [
+            "192.168.1.20:4646",
+            "10.0.0.5:4646",
+            "172.20.1.1:4646",
+            "169.254.10.2:4646",
+            "127.0.0.1:4646",
+            "[fe80::1]:4646",
+            "[fd12:3456::1]:4646",
+        ] {
+            assert!(is_lan(lan.parse().unwrap()), "{lan} is a LAN address");
+        }
+
+        for remote in [
+            "26.14.120.8:4646",    // Radmin VPN
+            "100.101.102.103:4646", // Tailscale
+            "203.0.113.9:4646",
+            "[2001:db8::1]:4646",
+        ] {
+            assert!(!is_lan(remote.parse().unwrap()), "{remote} leaves the LAN");
+        }
+    }
 }
 
 /// Turn a raw QUIC failure into something a user can act on.

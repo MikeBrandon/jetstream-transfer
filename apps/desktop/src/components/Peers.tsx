@@ -17,9 +17,10 @@ interface Props {
   peers: PeerView[];
   armed: boolean;
   onPick: (peer: PeerView) => void;
+  onAddByAddress: () => void;
 }
 
-export function Peers({ peers, armed, onPick }: Props) {
+export function Peers({ peers, armed, onPick, onAddByAddress }: Props) {
   if (peers.length === 0) {
     return (
       <div className="empty">
@@ -29,7 +30,12 @@ export function Peers({ peers, armed, onPick }: Props) {
           here within a few seconds.
         </p>
         <p className="hint">
-          Nothing showing up? The Network tab will tell you why.
+          Nothing showing up? The Network tab will tell you why. On a VPN like
+          Radmin or Tailscale, devices do not appear by themselves —{" "}
+          <button className="link" onClick={onAddByAddress}>
+            add one by its address
+          </button>
+          .
         </p>
       </div>
     );
@@ -53,7 +59,7 @@ export function Peers({ peers, armed, onPick }: Props) {
               disabled={blocked}
               title={
                 blocked
-                  ? "This device is blocked. Unblock it in Devices to send to it."
+                  ? "This device is blocked. Unblock it in the Paired tab to send to it."
                   : `${peer.fingerprint}\nfound via ${peer.sources.join(", ")}`
               }
               style={blocked ? { opacity: 0.45, cursor: "not-allowed" } : undefined}

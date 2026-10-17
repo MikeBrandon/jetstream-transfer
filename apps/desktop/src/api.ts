@@ -31,6 +31,8 @@ export interface SelfView {
   downloadDir: string;
   /** Running from a `Jetstream Data` folder beside the executable. */
   portable: boolean;
+  /** This machine's IPv4 addresses, for "Add by address" elsewhere. */
+  addresses: string[];
 }
 
 export interface PeerView {
@@ -40,6 +42,13 @@ export interface PeerView {
   address: string | null;
   sources: string[];
   trust: TrustView;
+}
+
+/** A device added by address, for networks discovery cannot see across. */
+export interface ManualDevice {
+  deviceId: string;
+  name: string;
+  address: string;
 }
 
 export interface TrustedView {
@@ -92,6 +101,8 @@ export interface OfferView {
   totalBytes: number;
   topLevel: string[];
   moreTopLevel: boolean;
+  /** From a browser, not a Jetstream device: no key, so no fingerprint. */
+  browser: boolean;
 }
 
 export interface FindingView {
@@ -106,6 +117,9 @@ export interface FirewallView {
   canFix: boolean;
   summary: string;
   remedy: string;
+  /** The phone-sharing rule, which is separate: the web server is TCP. */
+  browserState: FirewallView["state"];
+  browserAllowed: boolean;
 }
 
 export interface DiagnosticsView {
@@ -130,7 +144,10 @@ export interface WebStatusView {
   qrSvg: string;
   expiresIn: number;
   guests: number;
+  /** The address the current code points at. */
   address: string;
+  /** Every network this machine can be reached on from a browser. */
+  addresses: { ip: string; interface: string }[];
 }
 
 export interface HistoryView {
@@ -140,13 +157,21 @@ export interface HistoryView {
   sending: boolean;
   summary: string;
   bytes: number;
-  outcome: "completed" | "interrupted" | "declined" | "failed";
+  outcome: "completed" | "interrupted" | "paused" | "cancelled" | "declined" | "failed";
   at: number;
   /** True when the app will retry by itself once the peer reappears. */
   willRetry: boolean;
   attempts: number;
   detail: string | null;
+  /** How much had arrived when it last stopped. */
+  transferred: number;
   canRetry: boolean;
+}
+
+/** Text pasted on a phone or other browser and sent to this machine. */
+export interface WebText {
+  from: string;
+  text: string;
 }
 
 export interface SettingsView {
@@ -171,6 +196,11 @@ export const api = {
 
   sendToPeer: (deviceId: string, paths: string[]) =>
     invoke<number>("send_to_peer", { deviceId, paths }),
+  addDeviceByAddress: (address: string) =>
+    invoke<PeerView>("add_device_by_address", { address }),
+  listManualDevices: () => invoke<ManualDevice[]>("list_manual_devices"),
+  forgetManualDevice: (deviceId: string) =>
+    invoke<void>("forget_manual_device", { deviceId }),
   cancelTransfer: (id: number) => invoke<void>("cancel_transfer", { id }),
   pauseTransfer: (id: number) => invoke<void>("pause_transfer", { id }),
   revealTransfer: (id: number) => invoke<void>("reveal_transfer", { id }),
@@ -190,7 +220,8 @@ export const api = {
   networkProfileStatus: () => invoke<NetworkProfileView>("network_profile_status"),
   makeNetworkPrivate: () => invoke<NetworkProfileView>("make_network_private"),
 
-  startWeb: () => invoke<WebStatusView>("start_web"),
+  /** Start sharing if needed, and mint a code — for `address`, if given. */
+  startWeb: (address?: string) => invoke<WebStatusView>("start_web", { address: address ?? null }),
   stopWeb: () => invoke<WebStatusView>("stop_web"),
   webStatus: () => invoke<WebStatusView>("web_status"),
   setWebShared: (paths: string[], text: string | null) =>
@@ -226,7 +257,23 @@ export const events = {
   /** The window was hidden rather than closed, for the first time. */
   hiddenToTray: (fn: () => void): Promise<UnlistenFn> =>
     listen("hidden-to-tray", () => fn()),
+  /** Something worth a toast that no button caused, e.g. a resume starting. */
+  notice: (fn: (text: string) => void): Promise<UnlistenFn> =>
+    listen<string>("notice", (e) => fn(e.payload)),
+  /** A transfer finished, so the history list is out of date. */
+  historyChanged: (fn: () => void): Promise<UnlistenFn> =>
+    listen("history-changed", () => fn()),
+  /** Text sent from a browser. */
+  webText: (fn: (text: WebText) => void): Promise<UnlistenFn> =>
+    listen<WebText>("web-text", (e) => fn(e.payload)),
 };
+
+/** States in which a transfer is still going. Everything else has stopped. */
+export const RUNNING_STATES: TransferState[] = ["connecting", "waiting", "active"];
+
+export function isRunning(transfer: TransferView): boolean {
+  return RUNNING_STATES.includes(transfer.state);
+}
 
 /* --------------------------------------------------------------- helpers -- */
 
@@ -240,6 +287,21 @@ export function formatBytes(bytes: number): string {
     unit++;
   }
   return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+/**
+ * A percentage that never claims more than is true.
+ *
+ * Rounded down, so a transfer never reads 100% while it is still going. On a
+ * large transfer one decimal place is shown: at 100 GB a whole percent is a
+ * gigabyte, and a figure that does not move for a minute looks stuck.
+ */
+export function formatPercent(done: number, total: number): string {
+  if (total <= 0) return "0%";
+  const percent = Math.min(100, (done / total) * 100);
+  if (done >= total) return "100%";
+  if (total >= 1024 ** 3) return `${(Math.floor(percent * 10) / 10).toFixed(1)}%`;
+  return `${Math.floor(percent)}%`;
 }
 
 export function formatRate(bytesPerSecond: number): string {
