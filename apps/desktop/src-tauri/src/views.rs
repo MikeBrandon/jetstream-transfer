@@ -479,6 +479,13 @@ pub struct SettingsView {
     /// so nobody's app changes under them without asking.
     #[serde(default = "default_interface")]
     pub interface: String,
+    /// How transfers to internet and VPN peers pace themselves: `standard`
+    /// (the default) or `bbr` (experimental). LAN transfers ignore it.
+    ///
+    /// Defaulted, so a settings file written before this existed loads as
+    /// `standard` and nobody's behaviour changes by upgrading.
+    #[serde(default = "default_remote_congestion")]
+    pub remote_congestion: String,
 }
 
 fn default_saving() -> String {
@@ -487,6 +494,10 @@ fn default_saving() -> String {
 
 fn default_interface() -> String {
     "classic".into()
+}
+
+fn default_remote_congestion() -> String {
+    "standard".into()
 }
 
 pub fn device_id_of(text: &str) -> Result<DeviceId, String> {

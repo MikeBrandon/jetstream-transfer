@@ -208,6 +208,26 @@ export function Settings({ self, onSaved }: Props) {
         </span>
       </label>
 
+      <label className="field">
+        <span className="label">Pacing over a VPN or the internet</span>
+        <select
+          value={settings.remoteCongestion}
+          onChange={(event) =>
+            patch({ remoteCongestion: event.target.value as SettingsView["remoteCongestion"] })
+          }
+        >
+          <option value="standard">Standard (recommended)</option>
+          <option value="bbr">BBR (experimental)</option>
+        </select>
+        <span className="hint">
+          How fast this device pushes data when sending to someone off your local
+          network. BBR can be steadier and keep the connection usable on lines that
+          slow to a crawl under load, but it is experimental and can crowd out
+          other traffic. It only affects sending, never the files themselves, and
+          your local network is unaffected. If it makes things worse, switch back.
+        </span>
+      </label>
+
       <h3 className="section-title" style={{ marginTop: 22 }}>
         Appearance
       </h3>
