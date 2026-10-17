@@ -391,6 +391,13 @@ impl Transfer {
             // Only the sender holds the data, so only it can pick a transfer up
             // again. A receive continues when the sender comes back.
             resumable: self.direction == Direction::Sending && self.state.is_resumable(),
+            // A finished row has nothing left to check, whatever the counters
+            // were last left holding.
+            check: if self.state.is_finished() {
+                None
+            } else {
+                self.progress.check().map(crate::views::CheckView::from_progress)
+            },
             rate_history: self.rate_history.iter().copied().collect(),
             reused: self.progress.bytes_reused.load(Ordering::Relaxed),
         }

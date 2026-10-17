@@ -157,6 +157,11 @@ async fn a_folder_arrives_intact() {
 
     within(sending).await.unwrap().unwrap();
 
+    // Verification now reports itself while it runs; once the transfer is over,
+    // neither side may still claim to be checking or waiting.
+    assert!(send_progress.check().is_none(), "sender left a check showing");
+    assert!(recv_progress.check().is_none(), "receiver left a check showing");
+
     assert_trees_match(&root, &destination.path().join("payload"));
     assert!(
         received.placements.iter().all(|p| matches!(p, Placement::Created(_))),

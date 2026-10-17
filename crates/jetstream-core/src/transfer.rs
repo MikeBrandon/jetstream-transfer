@@ -84,9 +84,115 @@ pub struct Progress {
     /// at their next chunk boundary rather than draining whatever QUIC had
     /// already buffered. 0 = carry on, otherwise a [`StopReason`] code.
     peer_stop: std::sync::atomic::AtomicU8,
+
+    /// What the transfer is doing while no data moves. See [`CheckKind`].
+    ///
+    /// Without this the row sat at 100% reading "5 B/s, 1s left" for as long
+    /// as it took to read an 8 GB file back from disk - on both machines - and
+    /// a user had no way to tell work from a hang.
+    check_kind: std::sync::atomic::AtomicU8,
+    /// Checks running right now. Several large files can finish together, so
+    /// these aggregate rather than overwrite.
+    check_active: std::sync::atomic::AtomicU32,
+    check_total: AtomicU64,
+    check_done: AtomicU64,
+}
+
+/// A step that reads a whole file instead of moving data, and so would
+/// otherwise look like a stall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    /// Reading an older copy, and the sender's original, to find chunks that
+    /// need not be sent. Before any data moves.
+    Comparing,
+    /// Reading a finished file back to confirm it matches the original. This
+    /// side's own read, so its progress is known.
+    Verifying,
+    /// This side is finished; the other device is still reading its copy.
+    /// Nothing here can measure that, so it carries no progress.
+    WaitingForPeer,
+}
+
+impl CheckKind {
+    fn code(self) -> u8 {
+        match self {
+            Self::Comparing => 1,
+            Self::Verifying => 2,
+            Self::WaitingForPeer => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Comparing),
+            2 => Some(Self::Verifying),
+            3 => Some(Self::WaitingForPeer),
+            _ => None,
+        }
+    }
+}
+
+/// Ends a check when dropped, so an early return or an error can never leave
+/// a transfer reporting a check that is no longer running.
+pub(crate) struct CheckGuard(Arc<Progress>);
+
+impl Drop for CheckGuard {
+    fn drop(&mut self) {
+        let progress = &self.0;
+        // The last check to finish clears the lot. Totals from overlapping checks
+        // are summed, so ending one early would leave a misleading percentage.
+        if progress.check_active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            progress.check_total.store(0, Ordering::Relaxed);
+            progress.check_done.store(0, Ordering::Relaxed);
+            progress.check_kind.store(0, Ordering::Release);
+        }
+    }
 }
 
 impl Progress {
+    /// The check under way, if any: what it is, and bytes read of bytes to read.
+    pub fn check(&self) -> Option<(CheckKind, u64, u64)> {
+        let kind = CheckKind::from_code(self.check_kind.load(Ordering::Acquire))?;
+        Some((
+            kind,
+            self.check_done.load(Ordering::Relaxed),
+            self.check_total.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Start a check of `total` bytes. Ends when the guard is dropped.
+    pub(crate) fn begin_check(self: &Arc<Self>, kind: CheckKind, total: u64) -> CheckGuard {
+        self.check_active.fetch_add(1, Ordering::AcqRel);
+        self.check_total.fetch_add(total, Ordering::Relaxed);
+        self.check_kind.store(kind.code(), Ordering::Release);
+        CheckGuard(Arc::clone(self))
+    }
+
+    pub(crate) fn check_advance(&self, bytes: u64) {
+        self.check_done.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// This side has finished its part; the other device is still working.
+    ///
+    /// Only when nothing of ours is still running - our own measurable check
+    /// is the more informative thing to show.
+    pub(crate) fn wait_for_peer(&self) {
+        if self.check_active.load(Ordering::Acquire) == 0 {
+            self.check_kind
+                .store(CheckKind::WaitingForPeer.code(), Ordering::Release);
+        }
+    }
+
+    /// The other device answered, or data is moving again.
+    pub(crate) fn stop_waiting_for_peer(&self) {
+        let _ = self.check_kind.compare_exchange(
+            CheckKind::WaitingForPeer.code(),
+            0,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
     pub fn fraction(&self) -> f64 {
         let total = self.bytes_total.load(Ordering::Relaxed);
         if total == 0 {
@@ -386,7 +492,11 @@ pub async fn send_with(
             && options.saving.applies(session.peer().remote_address),
     };
 
-    serve_requests(session, root, manifest, progress, framing).await
+    // However serving ends - complete, aborted, or the connection lost - this
+    // side is no longer waiting on the receiver, and must not keep saying so.
+    let outcome = serve_requests(session, root, manifest, Arc::clone(&progress), framing).await;
+    progress.stop_waiting_for_peer();
+    outcome
 }
 
 /// How chunk frames are written to this peer.
@@ -577,6 +687,8 @@ async fn answer(
 
     match request {
         DataRequest::Chunks { entry, range } => {
+            // Data is moving again, so the receiver is not just checking any more.
+            progress.stop_waiting_for_peer();
             let source = resolve_source(manifest, root, entry)?;
             let size = manifest.entries[entry as usize].size();
 
@@ -625,14 +737,24 @@ async fn answer(
         DataRequest::ChunkHashes { entry, range } => {
             let source = resolve_source(manifest, root, entry)?;
             let size = manifest.entries[entry as usize].size();
-            for hash in hash_chunks(source, size, range).await? {
+            let hashes = {
+                let _check = progress.begin_check(CheckKind::Comparing, range_bytes(range, size));
+                hash_chunks(source, size, range, Arc::clone(&progress)).await?
+            };
+            for hash in hashes {
                 send.write_all(&hash).await?;
             }
         }
         DataRequest::FileHash { entry } => {
             let source = resolve_source(manifest, root, entry)?;
-            let hash = hash_file(&source).await?;
+            let size = manifest.entries[entry as usize].size();
+            let hash = {
+                let _check = progress.begin_check(CheckKind::Verifying, size);
+                hash_file(&source, Arc::clone(&progress)).await?
+            };
             send.write_all(&hash).await?;
+            // Our copy is checked; the receiver may still be reading its own.
+            progress.wait_for_peer();
         }
     }
 
@@ -734,7 +856,12 @@ fn read_range(
 }
 
 /// The BLAKE3 of each chunk in a range, for [`DataRequest::ChunkHashes`].
-async fn hash_chunks(path: PathBuf, size: u64, range: ChunkRange) -> Result<Vec<[u8; 32]>> {
+async fn hash_chunks(
+    path: PathBuf,
+    size: u64,
+    range: ChunkRange,
+    progress: Arc<Progress>,
+) -> Result<Vec<[u8; 32]>> {
     let path = to_extended_length(&path);
 
     tokio::task::spawn_blocking(move || -> Result<Vec<[u8; 32]>> {
@@ -750,6 +877,7 @@ async fn hash_chunks(path: PathBuf, size: u64, range: ChunkRange) -> Result<Vec<
             let (_, len) = chunk::chunk_span(index, size)?;
             file.read_exact(&mut buffer[..len])?;
             hashes.push(*blake3::hash(&buffer[..len]).as_bytes());
+            progress.check_advance(len as u64);
         }
         Ok(hashes)
     })
@@ -757,7 +885,7 @@ async fn hash_chunks(path: PathBuf, size: u64, range: ChunkRange) -> Result<Vec<
     .map_err(|e| Error::Io(std::io::Error::other(e)))?
 }
 
-async fn hash_file(path: &Path) -> Result<[u8; 32]> {
+async fn hash_file(path: &Path, progress: Arc<Progress>) -> Result<[u8; 32]> {
     let path = to_extended_length(path);
 
     tokio::task::spawn_blocking(move || -> Result<[u8; 32]> {
@@ -773,11 +901,19 @@ async fn hash_file(path: &Path) -> Result<[u8; 32]> {
                 break;
             }
             hasher.update(&buffer[..read]);
+            progress.check_advance(read as u64);
         }
         Ok(*hasher.finalize().as_bytes())
     })
     .await
     .map_err(|e| Error::Io(std::io::Error::other(e)))?
+}
+
+/// Bytes covered by `range` in a file of `size` bytes.
+fn range_bytes(range: ChunkRange, size: u64) -> u64 {
+    let start = u64::from(range.start) * CHUNK_SIZE;
+    let end = (u64::from(range.end) * CHUNK_SIZE).min(size);
+    end.saturating_sub(start)
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,10 +1254,20 @@ enum WriteCommand {
         data: Vec<u8>,
         hash: [u8; 32],
     },
+    /// Read a completed file back and hash it, so the comparison with the
+    /// sender's hash can wait for both reads at once rather than one after the
+    /// other. Queued behind the file's chunks, so every byte is written first.
+    Hash {
+        entry: u32,
+        reply: tokio::sync::oneshot::Sender<Result<[u8; 32]>>,
+    },
     /// Verify a completed file and deliver it.
     Finish {
         entry: u32,
         hash: [u8; 32],
+        /// This side's hash, already computed by `Hash`. `None` means compute it
+        /// here, as before.
+        local: Option<[u8; 32]>,
         /// True when the file fits in a single chunk, so the hash it was already
         /// verified against *is* its whole-file hash and there is nothing to
         /// re-read. See `Staging::finish_single_chunk_file`.
@@ -1199,7 +1345,9 @@ async fn pull_everything(
     // I/O for the whole transfer, which is exactly what must not happen on an
     // async worker.
     let (commands, mut inbox) = tokio::sync::mpsc::channel::<WriteCommand>(PARALLEL_REQUESTS * 2);
-    let writer = tokio::task::spawn_blocking(move || run_writer(staging, &mut inbox));
+    let writer_progress = Arc::clone(&progress);
+    let writer =
+        tokio::task::spawn_blocking(move || run_writer(staging, &mut inbox, &writer_progress));
 
     // Shared queue plus per-entry counters. When a worker takes the last piece
     // of a file, it is the one that verifies and delivers it — which keeps
@@ -1318,10 +1466,31 @@ async fn finish_one(
     // there is no whole-file hash to fetch and nothing left to check. On a
     // transfer of thousands of small files this removes a round trip and a full
     // file read on each side, per file.
-    let hash = if single_chunk {
-        [0u8; 32]
+    let (hash, local) = if single_chunk {
+        ([0u8; 32], None)
     } else {
-        request_file_hash(session, entry).await?
+        // Both reads at once. The sender reads its original to hash it while the
+        // writer reads this side's copy; one after the other they cost the sum,
+        // together only the longer. For an 8 GB file that is the difference
+        // between two full passes of waiting at 100% and one.
+        let (reply, mine) = tokio::sync::oneshot::channel();
+        commands
+            .send(WriteCommand::Hash { entry, reply })
+            .await
+            .map_err(|_| writer_stopped())?;
+
+        let ours = async {
+            let local = mine.await.map_err(|_| writer_stopped())??;
+            // Our half is done. If theirs is not, say so rather than go quiet.
+            progress.wait_for_peer();
+            Ok::<_, Error>(local)
+        };
+        let joined = tokio::try_join!(request_file_hash(session, entry), ours);
+        // Before `?`: if the sender's half failed after ours finished, the wait
+        // was already showing, and an error must not leave it there.
+        progress.stop_waiting_for_peer();
+        let (remote, local) = joined?;
+        (remote, Some(local))
     };
 
     let (reply, answer) = tokio::sync::oneshot::channel();
@@ -1330,6 +1499,7 @@ async fn finish_one(
         .send(WriteCommand::Finish {
             entry,
             hash,
+            local,
             single_chunk,
             reply,
         })
@@ -1352,6 +1522,10 @@ async fn finish_one(
     Ok(())
 }
 
+fn writer_stopped() -> Error {
+    Error::Io(std::io::Error::other("the disk writer stopped"))
+}
+
 /// The disk writer. Owns [`Staging`] for the whole transfer.
 ///
 /// Returns the files delivered while the transfer was running; the final
@@ -1359,6 +1533,7 @@ async fn finish_one(
 fn run_writer(
     mut staging: Staging,
     inbox: &mut tokio::sync::mpsc::Receiver<WriteCommand>,
+    progress: &Arc<Progress>,
 ) -> Result<Vec<Placement>> {
     let mut placed = Vec::new();
 
@@ -1378,14 +1553,35 @@ fn run_writer(
                 }
             }
 
+            WriteCommand::Hash { entry, reply } => {
+                let size = staging
+                    .manifest()
+                    .entries
+                    .get(entry as usize)
+                    .map(|e| e.size())
+                    .unwrap_or(0);
+                // The guard is dropped *before* replying: the caller treats the
+                // reply as "our half is done" and may then show that it is
+                // waiting for the other device, which it must not do while this
+                // check still counts as running.
+                let outcome = {
+                    let _check = progress.begin_check(CheckKind::Verifying, size);
+                    staging.hash_staged_file(entry, &mut |read| progress.check_advance(read))
+                };
+                let _ = reply.send(outcome);
+            }
+
             WriteCommand::Finish {
                 entry,
                 hash,
+                local,
                 single_chunk,
                 reply,
             } => {
                 let outcome = if single_chunk {
                     staging.finish_single_chunk_file(entry)
+                } else if let Some(local) = local {
+                    staging.place_verified(entry, &local, &hash)
                 } else {
                     staging.finish_file(entry, &hash)
                 };
@@ -1560,7 +1756,7 @@ async fn reuse_older_copies(
     session: &Session,
     mut staging: Staging,
     destination: &Path,
-    progress: &Progress,
+    progress: &Arc<Progress>,
 ) -> Result<Staging> {
     let mut candidates = Vec::new();
     for (index, entry) in staging.manifest().entries.iter().enumerate() {
@@ -1604,6 +1800,15 @@ async fn reuse_older_copies(
         return Ok(staging);
     }
 
+    // Two reads of every candidate range - the sender's original for its hashes,
+    // then this side's older copy - and nothing on the wire meanwhile, so it is
+    // reported as one comparison covering both, or it would look like a stall.
+    let compared: u64 = candidates
+        .iter()
+        .map(|(_, _, size, ranges)| ranges.iter().map(|r| range_bytes(*r, *size)).sum::<u64>())
+        .sum();
+    let _check = progress.begin_check(CheckKind::Comparing, compared * 2);
+
     // The network half: every hash, before touching the disk.
     let mut wanted = Vec::new();
     for (index, existing, size, ranges) in candidates {
@@ -1613,7 +1818,10 @@ async fn reuse_older_copies(
                 let end = (start + HASHES_PER_REQUEST).min(range.end);
                 let piece = ChunkRange::new(start, end);
                 match request_chunk_hashes(session, index, piece).await {
-                    Ok(hashes) => wanted.push((index, existing.clone(), size, piece, hashes)),
+                    Ok(hashes) => {
+                        progress.check_advance(range_bytes(piece, size));
+                        wanted.push((index, existing.clone(), size, piece, hashes));
+                    }
                     Err(e) => {
                         tracing::debug!(error = %e, "could not get chunk hashes; sending in full");
                         break;
@@ -1625,10 +1833,12 @@ async fn reuse_older_copies(
     }
 
     // The disk half, off the async runtime: it may read gigabytes.
+    let disk_progress = Arc::clone(progress);
     let (staging, reused) = tokio::task::spawn_blocking(move || {
         let mut reused = 0u64;
         for (index, existing, size, range, hashes) in wanted {
             reused += reuse_matching(&mut staging, index, &existing, size, range, &hashes);
+            disk_progress.check_advance(range_bytes(range, size));
         }
         (staging, reused)
     })
@@ -1823,6 +2033,62 @@ mod tests {
             more_top_level: false,
         };
         assert!(!describe(&summary).contains('\u{202E}'));
+    }
+
+    #[test]
+    fn a_check_reports_while_running_and_clears_when_done() {
+        let progress = Arc::new(Progress::default());
+        assert!(progress.check().is_none(), "nothing to report at rest");
+
+        {
+            let _check = progress.begin_check(CheckKind::Verifying, 1000);
+            progress.check_advance(400);
+            assert_eq!(progress.check(), Some((CheckKind::Verifying, 400, 1000)));
+        }
+
+        // The regression this exists for: a label left behind after the work
+        // ends would be as misleading as no label during it.
+        assert!(progress.check().is_none(), "must clear when the check ends");
+    }
+
+    #[test]
+    fn overlapping_checks_clear_only_when_the_last_one_ends() {
+        let progress = Arc::new(Progress::default());
+        let first = progress.begin_check(CheckKind::Verifying, 100);
+        let second = progress.begin_check(CheckKind::Verifying, 300);
+        assert_eq!(progress.check().map(|c| c.2), Some(400), "totals add up");
+
+        drop(first);
+        assert!(progress.check().is_some(), "one is still running");
+        drop(second);
+        assert!(progress.check().is_none());
+    }
+
+    #[test]
+    fn waiting_for_the_peer_never_hides_our_own_check() {
+        let progress = Arc::new(Progress::default());
+
+        // While our own read runs, it is the more useful thing to show.
+        let check = progress.begin_check(CheckKind::Verifying, 100);
+        progress.wait_for_peer();
+        assert_eq!(progress.check().map(|c| c.0), Some(CheckKind::Verifying));
+        drop(check);
+
+        // Once ours is done, say we are waiting rather than go quiet...
+        progress.wait_for_peer();
+        assert_eq!(progress.check().map(|c| c.0), Some(CheckKind::WaitingForPeer));
+
+        // ...and clear it when they answer.
+        progress.stop_waiting_for_peer();
+        assert!(progress.check().is_none());
+    }
+
+    #[test]
+    fn stopping_the_wait_leaves_a_real_check_alone() {
+        let progress = Arc::new(Progress::default());
+        let _check = progress.begin_check(CheckKind::Comparing, 100);
+        progress.stop_waiting_for_peer();
+        assert_eq!(progress.check().map(|c| c.0), Some(CheckKind::Comparing));
     }
 
     #[test]

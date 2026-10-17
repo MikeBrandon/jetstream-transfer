@@ -190,6 +190,36 @@ pub struct SkippedView {
 /// first few plus a count does perfectly well.
 pub const MAX_SKIPPED_SHOWN: usize = 50;
 
+/// A check in progress, for the transfer row.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckView {
+    /// `comparing`, `verifying`, or `waitingForPeer`.
+    pub kind: &'static str,
+    /// Bytes read so far, of `total`. Both zero for `waitingForPeer`, whose
+    /// progress is on the other machine and cannot be measured from here.
+    pub done: u64,
+    pub total: u64,
+}
+
+impl CheckView {
+    pub fn from_progress(check: (jetstream_core::transfer::CheckKind, u64, u64)) -> Self {
+        use jetstream_core::transfer::CheckKind;
+        let (kind, done, total) = check;
+        Self {
+            kind: match kind {
+                CheckKind::Comparing => "comparing",
+                CheckKind::Verifying => "verifying",
+                CheckKind::WaitingForPeer => "waitingForPeer",
+            },
+            // Never past the total, which overlapping reads could otherwise
+            // briefly produce.
+            done: done.min(total),
+            total,
+        }
+    }
+}
+
 /// One transfer, as the list renders it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -230,6 +260,13 @@ pub struct TransferView {
     /// Computed here so the UI's "Resume" affordance cannot drift out of step
     /// with what the engine will actually do.
     pub resumable: bool,
+    /// A whole-file read under way instead of data moving - comparing with an
+    /// existing copy, or verifying a finished file. `None` when there is none.
+    ///
+    /// Exists so the row can say what is happening at the points where it used
+    /// to sit at 0% or 100% reading "5 B/s" while both machines read gigabytes
+    /// from disk.
+    pub check: Option<CheckView>,
     /// Speed over the last minute, one reading a second, oldest first.
     pub rate_history: Vec<u64>,
     /// Bytes copied from an older copy already at the destination instead of
